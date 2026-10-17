@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """
-Stoneshard Wiki -> base de dados local em JSON (+ imagens).
+Stoneshard Wiki -> base de dados local em JSON (+ imagens).      [patch 1.1]
 
 Fluxo:
   1. Detecta o api.php da wiki (MediaWiki 1.45.x em stoneshard.com/wiki).
-  2. Semeia a fila BFS com os links da sidebar (MediaWiki:Sidebar -> "Gear", "Consumables"...)
-     e com os links da pagina inicial. O titulo da secao vira o 1o item do breadcrumb.
+  2. Semeia a fila BFS com as SECOES da pagina inicial (Character, Gear, Consumables...),
+     que viram o 1o item do breadcrumb; a sidebar e usada apenas como fallback.
   3. Para cada pagina: action=parse -> HTML renderizado + wikitext + categorias.
-       - infobox  -> dict chave/valor (heuristicas genericas, ver parse_infobox)
-       - wikitable -> listas de registros em dados_estruturados["tabelas"]
-       - texto limpo, links filhos, imagens (resolucao original)
+       - infobox   -> dict chave/valor em dados_estruturados (ver parse_infobox)
+       - tabelas   -> lista de objetos em dados_estruturados["tabelas"] (ver parse_tables):
+                      * "tabela": cabecalho vira chave (ate cabecalho so de icones)
+                      * "grade" : grade de icones/links (ex.: pagina Weapons)
+       - templates -> parametros em dados_estruturados["_wikitext_templates"]
+       - imagens de infobox, de celulas de tabela e do corpo sao baixadas; so o
+         caminho local e gravado no JSON
   4. Paginas com infobox (itens) sao "folhas": nao expandimos seus links.
   5. Grava output/pages/<titulo>.json (permite retomar) e output/stoneshard_db.json.
 
 Uso:
   python stoneshard_scraper.py --max-pages 30            # teste curto
   python stoneshard_scraper.py --section Gear            # so a secao Gear
+  python stoneshard_scraper.py --page Swords --page "Arna's Sword" --out out_test
+                                                         # so estas paginas + dump HTML/wikitext
   python stoneshard_scraper.py                           # tudo
 """
 from __future__ import annotations
@@ -30,16 +36,20 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import mwparserfromhell
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment, NavigableString
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 log = logging.getLogger("stoneshard")
+
+# Versao do formato dos registros. Registros salvos com outra versao sao
+# reprocessados (o cache de output/pages e invalidado automaticamente).
+SCHEMA_VERSION = 2
 
 # --------------------------------------------------------------------------- #
 # Configuracao e constantes
@@ -56,11 +66,12 @@ class Config:
     max_depth: int = 6               # tamanho maximo do breadcrumb
     max_pages: int = 0               # 0 = sem limite
     only_sections: list[str] = field(default_factory=list)
+    only_pages: list[str] = field(default_factory=list)   # modo --page
     expand_leaves: bool = False      # True = tambem segue links de paginas de item
     download_images: bool = True
     refresh: bool = False            # ignora cache de paginas ja salvas
     home_label: str = "Stoneshard Wiki"
-    user_agent: str = ("StoneshardOfflineArchiver/1.0 "
+    user_agent: str = ("StoneshardOfflineArchiver/1.1 "
                        "(arquivo pessoal offline; contato: voce@exemplo.com)")
     ignore_images: set[str] = field(default_factory=lambda: {
         "Note1.png", "Stoneshard.png", "Mediawiki_compact.svg"})
@@ -80,6 +91,9 @@ IGNORED_NAMESPACES = {"file", "category", "special", "talk", "template", "templa
                       "user", "user talk", "mediawiki", "mediawiki talk", "help", "module",
                       "project", "stoneshard wiki", "media", "file talk", "category talk"}
 LANG_SUBPAGE = re.compile(r"/(cz|zh|es|pt-br|ru|uk|de|fr|pl|ja|ko|tr|it)$", re.I)
+# Subpaginas de template (tooltips etc.) e titulos com sintaxe de wikitext vazada
+TECH_SUBPAGE = re.compile(r"/(tooltip|doc|sandbox|testcases)$", re.I)
+BAD_TITLE_CHARS = re.compile(r"[{}|\[\]<>#]")
 NON_PAGE_PREFIXES = ("images/", "resources/", "extensions/", "skins/", "api.php",
                      "index.php", "load.php")
 NOISE_SELECTORS = [".navbox", ".toc", "#toc", ".mw-editsection", ".ambox", ".mbox-small",
@@ -88,12 +102,30 @@ NOISE_SELECTORS = [".navbox", ".toc", "#toc", ".mw-editsection", ".ambox", ".mbo
 NAV_TABLE_TITLES = {"items", "languages"}      # tabelas de navegacao sem classe CSS
 SEE_ALSO_TITLES = {"see also", "references", "external links"}
 SIDEBAR_SKIP = {"navigation", "search", "toolbox", "languages"}
+# Templates de wikitext que nao carregam dados de conteudo
+SKIP_TEMPLATES = {"stub", "navbox", "languages", "lang", "items", "see also", "main",
+                  "clear", "reflist", "notice", "ambox", "toc", "dablink", "about"}
+# Colunas cujo conteudo deve ser lido como lista de modificadores (chave: valor)
+STAT_HEADERS = ("propert", "effect", "stat", "bonus", "modif", "attribute", "bonuses")
 
 META_RE = re.compile(r"(Page last edited during patch|Data Page last updated in):\s*([\w.\-]+)")
-TIER_RE = re.compile(r"^Tier\s+(\d+)$", re.I)
-NUM_LABEL_RE = re.compile(r"^([+\-\u2212]?\d+(?:[.,]\d+)?%?)\s+([A-Za-z][A-Za-z' ]+)$")
-PAIR_RE = re.compile(r"([A-Za-z][A-Za-z '\u2019/&-]*?):\s*([+\-\u2212]?\d[\d.,/]*%?)")
+TIER_RE = re.compile(r"^Tier\s+(\d+)\b\s*(.*)$", re.I)
+NUM_LABEL_RE = re.compile(r"^([+\-−]?\d+(?:[.,]\d+)?%?)\s+([A-Za-z][A-Za-z' ]+)$")
+INLINE_NUMLABEL_RE = re.compile(
+    r"([+\-−]\d+(?:[.,]\d+)?%?)\s+([A-Za-z][A-Za-z' ]*?)(?=\s+[+\-−]\d|\s*$)")
+DAMAGE_LINE_RE = re.compile(r"^(?:\d+(?:\.\d+)?\s+[A-Za-z]+\s+Damage\s*)+$", re.I)
+PAIR_RE = re.compile(r"([A-Za-z][A-Za-z '’/&-]*?):\s*([+\-−]?\d[\d.,/]*%?)")
 THUMB_RE = re.compile(r"/images/thumb/([0-9a-f]/[0-9a-f]{2})/([^/]+)/[^/]+$")
+THUMB_W_RE = re.compile(r"/(\d+)px-[^/]+$")
+
+# Marcadores de icone dentro de linhas de texto (nao ocorrem em texto normal)
+ICON_L, ICON_R = "⟦", "⟧"
+ICON_RE = re.compile(f"{ICON_L}(.*?){ICON_R}")
+TRAILING_ICON_VALUE_RE = re.compile(
+    f"^(.*[^\\s\\d{ICON_R}])\\s+{ICON_L}([^{ICON_R}]+){ICON_R}\\s*([+\\-\\u2212]?\\d[\\d.,/]*%?)$")
+BLOCK_TAGS = {"p", "div", "tr", "td", "th", "table", "ul", "ol", "li", "dl", "dt", "dd",
+              "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "hr", "caption", "thead",
+              "tbody", "tfoot", "section", "center", "pre"}
 
 
 # --------------------------------------------------------------------------- #
@@ -107,7 +139,10 @@ def norm(title: str) -> str:
 
 
 def is_content_title(title: str) -> bool:
-    if not title or title.startswith(NON_PAGE_PREFIXES) or LANG_SUBPAGE.search(title):
+    if not title or BAD_TITLE_CHARS.search(title):
+        return False
+    if title.lower().startswith(NON_PAGE_PREFIXES) or LANG_SUBPAGE.search(title) \
+            or TECH_SUBPAGE.search(title):
         return False
     if ":" in title and title.split(":", 1)[0].strip().lower() in IGNORED_NAMESPACES:
         return False
@@ -120,10 +155,12 @@ def clean(el: Any, sep: str = "") -> str:
 
 
 def convert(val: str) -> Any:
-    """'80' -> 80, '1.5' -> 1.5, '+5%' / '80/80' continuam string."""
-    v = val.strip().replace("\u2212", "-")
+    """'80' -> 80, '1,250' -> 1250, '1.5' -> 1.5; '+5%' e 'Slashing: 17' continuam string."""
+    v = val.strip().replace("−", "-")
     if re.fullmatch(r"[+-]?\d+", v):
         return int(v)
+    if re.fullmatch(r"\d{1,3}(,\d{3})+", v):
+        return int(v.replace(",", ""))
     if re.fullmatch(r"[+-]?\d+\.\d+", v):
         return float(v)
     return val.strip()
@@ -166,6 +203,17 @@ def href_to_title(href: str, cfg: Config) -> str | None:
         return None
     title = norm(title)
     return title if is_content_title(title) else None
+
+
+def normalize_damage(text: str) -> str:
+    """'17 Slashing Damage' / 'Slashing 17' / 'Slashing 25 Sacred 2' -> 'Slashing: 25, Sacred: 2'."""
+    t = text.replace("−", "-").strip()
+    if re.match(r"^\d", t):
+        pairs = [(b, a) for a, b in re.findall(r"(\d+(?:\.\d+)?)\s*([A-Za-z]+)", t)]
+    else:
+        pairs = re.findall(r"([A-Za-z]+)\s*:?\s*(\d+(?:\.\d+)?)", t)
+    pairs = [(k, v) for k, v in pairs if k.lower() != "damage"]
+    return ", ".join(f"{k}: {v}" for k, v in pairs) if pairs else text
 
 
 # --------------------------------------------------------------------------- #
@@ -239,7 +287,7 @@ class WikiClient:
         return data["parse"]
 
     def sidebar_sections(self) -> dict[str, list[str]]:
-        """Le MediaWiki:Sidebar -> {'Gear': ['Weapons', 'Armor', ...], ...}."""
+        """Fallback: le MediaWiki:Sidebar -> {'Gear': ['Weapons', 'Armor', ...], ...}."""
         try:
             data = self.api(action="query", meta="allmessages", ammessages="sidebar")
             msg = data["query"]["allmessages"][0].get("content", "")
@@ -278,7 +326,7 @@ class WikiClient:
 
 
 # --------------------------------------------------------------------------- #
-# Parsing de HTML
+# Parsing de HTML: base
 # --------------------------------------------------------------------------- #
 
 def make_soup(html: str, drop_see_also: bool = False) -> BeautifulSoup:
@@ -316,7 +364,7 @@ def _drop_sections(soup: BeautifulSoup, titles: set[str]) -> None:
         wrapper.decompose()
 
 
-def extract_links(soup: BeautifulSoup, cfg: Config) -> list[str]:
+def extract_links(soup: Any, cfg: Config) -> list[str]:
     out: list[str] = []
     for a in soup.find_all("a", href=True):
         if "new" in (a.get("class") or []):          # redlink
@@ -327,85 +375,162 @@ def extract_links(soup: BeautifulSoup, cfg: Config) -> list[str]:
     return out
 
 
+def home_sections(html: str, cfg: Config) -> dict[str, list[str]]:
+    """
+    Secoes da pagina inicial: cada <ul> de links recebe como rotulo o texto solto mais
+    proximo antes dela ('Character', 'Gear', 'Consumables'...). Retorna {rotulo: [titulos]}.
+    """
+    soup = make_soup(html)
+    sections: dict[str, list[str]] = {}
+    for ul in soup.find_all("ul"):
+        if ul.find_parent("ul"):
+            continue
+        titles = extract_links(ul, cfg)
+        if not titles:
+            continue
+        node = ul.find_previous(
+            string=lambda s: bool(s and s.strip()) and not isinstance(s, Comment)
+            and not s.find_parent(["a", "li", "ul"]))
+        label = clean(node) if node else ""
+        if not label or len(label) > 40:
+            label = cfg.home_label
+        bucket = sections.setdefault(label, [])
+        bucket.extend(t for t in titles if t not in bucket)
+    return sections
+
+
 def to_original_url(url: str) -> str:
     """/images/thumb/a/ab/File.png/120px-File.png -> /images/a/ab/File.png"""
     return THUMB_RE.sub(r"/images/\1/\2", url)
 
 
-def collect_images(root: Any, cfg: Config) -> list[tuple[str, str]]:
-    """[(url_original, url_fallback)] sem duplicatas, na ordem do DOM."""
-    found: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for img in root.find_all("img"):
-        src = img.get("src") or ""
-        if not src or src.startswith("data:"):
-            continue
-        full = urljoin(cfg.site_root + "/", src)
-        orig = to_original_url(full)
-        name = unquote(urlparse(orig).path.rsplit("/", 1)[-1])
-        if name in cfg.ignore_images or orig in seen:
-            continue
-        seen.add(orig)
-        found.append((orig, full))
-    return found
+def img_name(img: Any) -> str:
+    """Nome legivel do arquivo da imagem (usado quando nao ha alt)."""
+    src = (img.get("src") or "").split("?")[0]
+    name = unquote(to_original_url(src).rsplit("/", 1)[-1])
+    name = re.sub(r"\.[A-Za-z0-9]+$", "", name)
+    return re.sub(r"[_\s]+", " ", name).strip()
 
 
-def find_infobox(root: BeautifulSoup) -> Any | None:
-    for sel in ("table.infobox", ".infobox", ".portable-infobox", "table[class*=infobox]"):
-        el = root.select_one(sel)
-        if el:
-            return el
-    # Heuristica: 1a tabela "solta" (nao wikitable) com imagem e pouco link
-    for t in root.find_all("table"):
-        if "wikitable" in (t.get("class") or []) or t.find_parent("table"):
-            continue
-        strings = list(t.stripped_strings)
-        if t.find("img") and 4 <= len(strings) <= 60 and len(t.find_all("a")) <= 8:
-            return t
-    return None
+def icon_like(img: Any) -> bool:
+    """True para icones pequenos (<= 32px): ficam nas celulas, nao na lista da pagina."""
+    try:
+        if img.get("width") and int(str(img["width"]).rstrip("px")) <= 32:
+            return True
+    except ValueError:
+        pass
+    m = THUMB_W_RE.search((img.get("src") or "").split("?")[0])
+    return bool(m and int(m.group(1)) <= 32)
 
 
-def parse_infobox(box: Any, title: str) -> dict[str, Any]:
+# --------------------------------------------------------------------------- #
+# Parsing de HTML: linhas logicas, infobox, tabelas
+# --------------------------------------------------------------------------- #
+
+def logical_lines(el: Any) -> list[str]:
     """
-    Extrai pares chave/valor de uma infobox de formato desconhecido:
-      a) linhas <tr> com 2 celulas curtas            -> chave/valor direto
-      b) 'Chave:' em um no e valor no proximo         -> par
-      c) 'Chave: valor' na mesma linha                -> par
-      d) '17 Slashing Damage' -> Damage: 'Slashing: 17'; 'Tier 2' -> Tier: 2
-      e) icones com alt (ex.: Price) viram 'Price: 475'
-      f) sobras: linha longa -> Description; 1a curta -> Classification; resto -> Extras
+    Quebra um elemento em 'linhas logicas': tags de bloco (div, tr, td, li, br...)
+    separam linhas; tags inline (span, a, b, i...) sao concatenadas. Imagens viram
+    marcadores ⟦alt⟧ (alt ou nome do arquivo), para que o icone nao se perca.
     """
-    attrs: dict[str, Any] = {}
-    for tr in box.find_all("tr"):
-        if tr.decomposed or tr.find("table"):
-            continue
-        cells = tr.find_all(["th", "td"], recursive=False)
-        if len(cells) == 2:
-            k, v = clean(cells[0], " "), clean(cells[1], " ")
-            if k and v and len(k) <= 40 and not cells[0].find("img"):
-                put(attrs, k, convert(v))
-                tr.decompose()
+    lines: list[str] = []
+    buf: list[str] = []
 
-    for img in box.find_all("img"):
-        alt = (img.get("alt") or "").strip()
-        img.replace_with(f"\n{alt}: " if alt and alt.lower() != title.lower() else "\n")
+    def flush() -> None:
+        txt = re.sub(r"\s+", " ", "".join(buf).replace("\xa0", " ")).strip()
+        buf.clear()
+        if txt and set(txt) - set("-–—|"):
+            lines.append(txt)
 
-    lines = [re.sub(r"\s+", " ", ln.replace("\xa0", " ")).strip()
-             for ln in box.get_text("\n").splitlines()]
-    lines = [ln for ln in lines if ln and set(ln) != {"-"}]
+    def walk(node: Any) -> None:
+        for c in node.children:
+            if isinstance(c, Comment):
+                continue
+            if isinstance(c, NavigableString):
+                buf.append(str(c))
+                continue
+            name = c.name
+            if name in ("script", "style"):
+                continue
+            if name == "img":
+                alt = (c.get("alt") or "").strip() or img_name(c)
+                buf.append(f" {ICON_L}{alt}{ICON_R} ")
+                continue
+            if name == "br":
+                flush()
+                continue
+            block = name in BLOCK_TAGS
+            if block:
+                flush()
+            walk(c)
+            if block:
+                flush()
+
+    walk(el)
+    flush()
+    return lines
+
+
+def resolve_icons(line: str) -> str:
+    """
+    ⟦Price⟧ 475            -> 'Price: 475'      (icone no inicio + valor numerico)
+    17 ⟦Slashing⟧ Damage   -> '17 Slashing Damage'
+    linha so de icones     -> ''
+    """
+    m = re.match(f"^{ICON_L}(.*?){ICON_R}\\s*(.*)$", line)
+    if m:
+        alt, rest = m.group(1).strip(), m.group(2).strip()
+        if not rest or ICON_L in rest and not ICON_RE.sub("", rest).strip():
+            return ""
+        bare = ICON_RE.sub("", rest).strip()
+        if alt and re.fullmatch(r"[+\-−]?\d[\d.,/]*%?", bare):      # icone + valor puro
+            return f"{alt}: {bare}"
+        # icone + texto: o alt so entra se ainda nao estiver escrito na linha
+        line = rest if not alt or alt.lower() in rest.lower() else f"{alt} {rest}"
+
+    plain = ICON_RE.sub(" ", line).lower()               # texto da linha sem marcadores
+
+    def repl(mm: re.Match) -> str:
+        alt = mm.group(1).strip()
+        return f" {alt} " if alt and alt.lower() not in plain else " "
+    return re.sub(r"\s+", " ", ICON_RE.sub(repl, line)).strip()
+
+
+def interpret_lines(lines: list[str], title: str, attrs: dict) -> list[str]:
+    """
+    Converte linhas logicas em pares chave/valor dentro de `attrs`; devolve as sobras.
+      'Chave:' + proxima linha      -> par          'Chave: valor' -> par
+      'Tier 2 ...'                  -> Tier: 2      '17 Slashing Damage' -> Damage
+      '+5% Armor Penetration'       -> Armor Penetration: '+5%'
+    """
+    expanded: list[str] = []
+    for ln in lines:                       # 'descricao... ⟦Price⟧ 475' -> 2 linhas
+        m = TRAILING_ICON_VALUE_RE.match(ln)
+        expanded += [m.group(1), f"{ICON_L}{m.group(2)}{ICON_R} {m.group(3)}"] if m else [ln]
+    queue = [resolve_icons(ln) for ln in expanded]
+    queue = [ln for ln in queue if ln]
     leftovers: list[str] = []
     i = 0
-    while i < len(lines):
-        ln = lines[i]
+    while i < len(queue):
+        ln = queue[i]
         i += 1
         if len(ln) > 80:
             leftovers.append(ln)
             continue
-        if ln.endswith(":") and i < len(lines) and not lines[i].endswith(":"):
-            put(attrs, ln[:-1], convert(lines[i]))
+        if m := TIER_RE.match(ln):
+            put(attrs, "Tier", int(m.group(1)))
+            rest = m.group(2).strip()
+            if rest:                                    # 'Tier 2 Arna's Sword Unique Sword'
+                if title and rest.lower().startswith(title.lower()):
+                    rest = rest[len(title):].strip()
+                if rest:
+                    queue.insert(i, rest)
+            continue
+        if ln.endswith(":") and i < len(queue) and not queue[i].endswith(":"):
+            put(attrs, ln[:-1], convert(queue[i]))
             i += 1
             continue
-        if ln.count(":") >= 2 and (pairs := PAIR_RE.findall(ln)):
+        if ln.count(":") >= 2 and len(pairs := PAIR_RE.findall(ln)) >= 2:
             for k, v in pairs:
                 put(attrs, k, convert(v))
             continue
@@ -414,58 +539,269 @@ def parse_infobox(box: Any, title: str) -> dict[str, Any]:
             if v.strip() and len(k.split()) <= 4 and "." not in k:
                 put(attrs, k, convert(v))
                 continue
-        if m := TIER_RE.match(ln):
-            put(attrs, "Tier", int(m.group(1)))
+        if DAMAGE_LINE_RE.match(ln):
+            dmg = normalize_damage(ln)
+            attrs["Damage"] = f"{attrs['Damage']}, {dmg}" if "Damage" in attrs else dmg
+            continue
+        if len(inline := INLINE_NUMLABEL_RE.findall(ln)) >= 2:
+            for num, label in inline:
+                put(attrs, label.strip(), convert(num))
             continue
         if m := NUM_LABEL_RE.match(ln):
-            num, label = m.group(1), m.group(2).strip()
-            if label.lower().endswith(" damage"):
-                dmg = f"{label[:-7].strip()}: {num}"
-                attrs["Damage"] = f"{attrs['Damage']}, {dmg}" if "Damage" in attrs else dmg
-            else:
-                put(attrs, label, convert(num))
+            put(attrs, m.group(2).strip(), convert(m.group(1)))
             continue
         leftovers.append(ln)
+    return leftovers
 
+
+def rows_of(table: Any) -> list[Any]:
+    """<tr> que pertencem a esta tabela (exclui as de tabelas aninhadas)."""
+    return [tr for tr in table.find_all("tr") if tr.find_parent("table") is table]
+
+
+def find_infobox(root: Any) -> Any | None:
+    for sel in ("table.infobox", ".infobox", ".portable-infobox", "table[class*=infobox]"):
+        el = root.select_one(sel)
+        if el:
+            return el
+
+    # Heuristica: tabela de topo, nao-wikitable, com imagem, >= 3 linhas e no maximo
+    # 2 celulas por linha (formato 'ficha'). Tabelas de dados (3+ colunas) nao entram.
+    def candidate(t: Any, allow_nested: bool) -> bool:
+        if t.find_parent("table") or "wikitable" in (t.get("class") or []):
+            return False
+        if t.find("table") and not allow_nested:
+            return False
+        rows = rows_of(t)
+        if len(rows) < 3 or not t.find("img") or len(t.find_all("a")) > 12:
+            return False
+        return max(len(r.find_all(["td", "th"], recursive=False)) for r in rows) <= 2
+
+    for allow_nested in (False, True):
+        for t in root.find_all("table"):
+            if candidate(t, allow_nested):
+                return t
+    return None
+
+
+def parse_infobox(box: Any, title: str) -> dict[str, Any]:
+    """
+    Extrai pares chave/valor de uma infobox de formato livre:
+      a) linha <tr> com 2 celulas curtas -> chave/valor direto
+      b) o resto vira linhas logicas e passa por interpret_lines()
+      c) sobras: texto longo -> Description; 1a linha curta -> Classification; resto -> Extras
+    """
+    attrs: dict[str, Any] = {}
+    for tr in rows_of(box):
+        cells = tr.find_all(["th", "td"], recursive=False)
+        if len(cells) == 2 and not tr.find("table") and not cells[0].find("img"):
+            k = " ".join(resolve_icons(x) for x in logical_lines(cells[0])).strip()
+            v = " ".join(resolve_icons(x) for x in logical_lines(cells[1])).strip()
+            if k and v and len(k) <= 40 and len(v) <= 200:
+                put(attrs, k.rstrip(":"), convert(v))
+                tr.decompose()
+
+    leftovers = interpret_lines(logical_lines(box), title, attrs)
     leftovers = [ln for ln in leftovers if ln.lower() != title.lower()]
-    desc = [ln for ln in leftovers if len(ln) > 40]
-    short = [ln for ln in leftovers if len(ln) <= 40]
+    desc = [ln for ln in leftovers if len(ln) > 40 or ln.endswith(".") or len(ln.split()) >= 6]
+    short = [ln for ln in leftovers if ln not in desc]
     if desc:
         put(attrs, "Description", max(desc, key=len))
     if short:
         put(attrs, "Classification", short[0])
         if len(short) > 1:
             attrs["Extras"] = short[1:]
+    dur = attrs.get("Durability")
+    if isinstance(dur, str) and (m := re.fullmatch(r"(\d+)/(\d+)", dur)) and m.group(1) == m.group(2):
+        attrs["Durability"] = int(m.group(1))            # 80/80 -> 80
     return attrs
 
 
-def parse_wikitables(root: Any) -> dict[str, list[dict]]:
-    tables: dict[str, list[dict]] = {}
-    for idx, t in enumerate(root.select("table.wikitable"), 1):
-        rows = t.find_all("tr")
+# -- tabelas ------------------------------------------------------------------
+
+def cell_texts(cell: Any) -> tuple[list[str], list[str]]:
+    """(linhas de texto sem icones, nomes dos icones)."""
+    texts, icons = [], []
+    for ln in logical_lines(cell):
+        icons += [x.strip() for x in ICON_RE.findall(ln) if x.strip()]
+        t = re.sub(r"\s+", " ", ICON_RE.sub(" ", ln)).strip()
+        if t:
+            texts.append(t)
+    return texts, icons
+
+
+def header_name(cell: Any, idx: int) -> str:
+    texts, icons = cell_texts(cell)
+    if texts:
+        return " ".join(texts)
+    if icons:
+        return re.sub(r"\s*icon$", "", " ".join(icons), flags=re.I).strip() or f"col{idx}"
+    return f"col{idx}"
+
+
+def shape_value(texts: list[str], icons: list[str], header: str) -> Any:
+    """Decide a forma do valor de uma celula: numero, string, dict de modificadores ou lista."""
+    h = header.lower()
+    if not texts:
+        return icons[0] if len(icons) == 1 else icons
+    if "damage" in h:
+        return normalize_damage(" ".join(texts))
+    if h == "tier" and len(texts) == 1 and (m := TIER_RE.match(texts[0])):
+        return int(m.group(1))
+    stat_col = any(s in h for s in STAT_HEADERS)
+    multi_pairs = len(texts) == 1 and len(PAIR_RE.findall(texts[0])) >= 2
+    if len(texts) >= 2 or stat_col or multi_pairs:
+        attrs: dict[str, Any] = {}
+        left = interpret_lines(list(texts), "", attrs)
+        if attrs and (stat_col or len(attrs) >= len(texts) / 2):
+            if left:
+                attrs["_outros"] = left
+            return attrs
+    return convert(texts[0]) if len(texts) == 1 else texts
+
+
+def expand_grid(rows: list[Any]) -> list[list[Any]]:
+    """Alinha colunas aplicando colspan/rowspan: devolve matriz de celulas (<td>/<th>)."""
+    def span(cell: Any, attr: str) -> int:
+        try:
+            return max(1, int(str(cell.get(attr, 1)).strip() or 1))
+        except ValueError:
+            return 1
+
+    grid: list[list[Any]] = []
+    carry: dict[int, tuple[int, Any]] = {}
+    for tr in rows:
+        row: list[Any] = []
+        cells = iter(tr.find_all(["td", "th"], recursive=False))
+        col = 0
+        while True:
+            if col in carry:
+                rem, cell = carry[col]
+                row.append(cell)
+                carry[col] = (rem - 1, cell)
+                if rem - 1 <= 0:
+                    del carry[col]
+                col += 1
+                continue
+            cell = next(cells, None)
+            if cell is None:
+                break
+            rs = span(cell, "rowspan")
+            for _ in range(span(cell, "colspan")):
+                row.append(cell)
+                if rs > 1:
+                    carry[col] = (rs - 1, cell)
+                col += 1
+        grid.append(row)
+    return grid
+
+
+def parse_tables(root: Any, resolver: Callable[[Any], str | None], cfg: Config) -> list[dict]:
+    """
+    Converte cada tabela 'folha' em registros:
+      tipo 'tabela': {"colunas": [...], "linhas": [{<cabecalho>: valor, "_paginas": [...],
+                      "_imagens": [caminhos locais]}]}
+      tipo 'grade' : {"celulas": [{"linha","coluna","secao","texto","paginas","imagens"}]}
+    Imagens de dentro das celulas sao baixadas via `resolver`.
+    """
+    out: list[dict] = []
+    memo: dict[int, tuple[list[str], list[str], list[str], list[str]]] = {}
+
+    def analyse(cell: Any) -> tuple[list[str], list[str], list[str], list[str]]:
+        key = id(cell)
+        if key not in memo:
+            texts, icons = cell_texts(cell)
+            imgs = list(dict.fromkeys(p for im in cell.find_all("img") if (p := resolver(im))))
+            pages = list(dict.fromkeys(
+                t for a in cell.find_all("a", href=True)
+                if "new" not in (a.get("class") or []) and (t := href_to_title(a["href"], cfg))))
+            memo[key] = (texts, icons, imgs, pages)
+        return memo[key]
+
+    for t in root.find_all("table"):
+        if t.decomposed or t.find("table"):
+            continue                                     # so tabelas folha
+        rows = rows_of(t)
         if not rows:
             continue
-        first = rows[0].find_all(["th", "td"])
-        if first and all(c.name == "th" for c in first):
-            header, body = [clean(c, " ") for c in first], rows[1:]
-        else:
-            header, body = [f"col{n}" for n in range(1, len(first) + 1)], rows
-        seen: dict[str, int] = {}
-        uniq = []
-        for h in header:                       # garante chaves unicas
-            h = h or "col"
-            seen[h] = seen.get(h, 0) + 1
-            uniq.append(h if seen[h] == 1 else f"{h}_{seen[h]}")
-        records = []
-        for tr in body:
-            vals = [clean(c, " ") for c in tr.find_all(["th", "td"])]
-            if not any(vals):
-                continue
-            records.append(dict(zip(uniq, vals)) if len(vals) == len(uniq) else {"_row": vals})
+        grid = expand_grid(rows)
+        ncols = max((len(r) for r in grid), default=0)
         cap = t.find("caption")
-        name = clean(cap) if cap and clean(cap) else f"tabela_{idx}"
-        tables[name] = records
-    return tables
+        head = t.find_previous(re.compile(r"^h[1-6]$"))
+        titulo = clean(cap) if cap and clean(cap) else (clean(head) if head else "")
+        all_cells = {id(c): c for r in grid for c in r}
+        if len(all_cells) <= 1 or (len(grid) == 1 and ncols <= 3 and not t.find(["a", "img"])):
+            continue                                     # caixas de citacao / layout trivial
+
+        first_all_th = bool(grid[0]) and all(c.name == "th" for c in grid[0])
+        th_only_body = any(r and all(c.name == "th" for c in r)
+                           and len({id(c) for c in r}) >= 2 for r in grid[1:])
+        is_data = first_all_th and ncols >= 2 and len(grid) >= 2 and not th_only_body
+
+        if is_data:
+            names, seen = [], {}
+            for idx, c in enumerate(grid[0], 1):
+                n = header_name(c, idx)
+                seen[n] = seen.get(n, 0) + 1
+                names.append(n if seen[n] == 1 else f"{n}_{seen[n]}")
+            linhas, secao = [], None
+            for r in grid[1:]:
+                distinct = list({id(c): c for c in r}.values())
+                if len(distinct) == 1 and ncols > 1:    # linha-divisoria de secao
+                    secao = " ".join(analyse(distinct[0])[0]) or secao
+                    continue
+                rec: dict[str, Any] = {}
+                paginas: list[str] = []
+                imagens: list[str] = []
+                for name, c in zip(names, r):
+                    texts, icons, imgs, pages = analyse(c)
+                    val = shape_value(texts, icons, name)
+                    if val not in ("", [], {}, None):
+                        rec[name] = val
+                    paginas += [p for p in pages if p not in paginas]
+                    imagens += [p for p in imgs if p not in imagens]
+                if len(r) != len(names):
+                    rec["_aviso"] = "linha com numero de colunas diferente do cabecalho"
+                if secao:
+                    rec["_secao"] = secao
+                if paginas:
+                    rec["_paginas"] = paginas
+                if imagens:
+                    rec["_imagens"] = imagens
+                if rec:
+                    linhas.append(rec)
+            if linhas:
+                out.append({"titulo": titulo, "tipo": "tabela", "colunas": names,
+                            "linhas": linhas})
+        else:
+            col_section: dict[int, str] = {}
+            celulas: list[dict] = []
+            for ri, r in enumerate(grid, 1):
+                prev = None
+                for ci, c in enumerate(r, 1):
+                    if c is prev:                         # celula com colspan ja tratada
+                        continue
+                    prev = c
+                    texts, icons, imgs, pages = analyse(c)
+                    if c.name == "th" and texts:
+                        for k in range(ci, ci + sum(1 for x in r if x is c)):
+                            col_section[k] = " ".join(texts)
+                        continue
+                    if not (texts or imgs or pages):
+                        continue
+                    cel: dict[str, Any] = {"linha": ri, "coluna": ci}
+                    if col_section.get(ci):
+                        cel["secao"] = col_section[ci]
+                    if texts:
+                        cel["texto"] = " ".join(texts)
+                    if pages:
+                        cel["paginas"] = pages
+                    if imgs:
+                        cel["imagens"] = imgs
+                    celulas.append(cel)
+            if celulas:
+                out.append({"titulo": titulo, "tipo": "grade", "celulas": celulas})
+    return out
 
 
 def _own_text(el: Any) -> str:
@@ -500,16 +836,26 @@ def extract_text(root: Any) -> tuple[str, dict[str, str]]:
 
 
 def wikitext_templates(wikitext: str) -> dict[str, dict[str, Any]]:
-    """Fallback: parametros de templates de topo (mwparserfromhell)."""
+    """Parametros dos templates de topo (mwparserfromhell), sem templates de navegacao."""
     out: dict[str, dict[str, Any]] = {}
-    for tpl in mwparserfromhell.parse(wikitext).filter_templates(recursive=False):
-        params = {}
-        for p in tpl.params:
-            val = mwparserfromhell.parse(str(p.value)).strip_code().strip()
-            if val:
-                params[str(p.name).strip()] = convert(val)
-        if params:
-            out[str(tpl.name).strip()] = params
+    try:
+        code = mwparserfromhell.parse(wikitext)
+        for tpl in code.filter_templates(recursive=False):
+            name = str(tpl.name).strip()
+            if name.lower() in SKIP_TEMPLATES or name.startswith("#"):
+                continue
+            params = {}
+            for p in tpl.params:
+                val = mwparserfromhell.parse(str(p.value)).strip_code().strip()
+                if val:
+                    params[str(p.name).strip()] = convert(val)
+            if params:
+                key, n = name, 2
+                while key in out:                        # mesmo template repetido
+                    key, n = f"{name}#{n}", n + 1
+                out[key] = params
+    except Exception as exc:                             # noqa: BLE001 - wikitext atipico
+        log.debug("wikitext_templates falhou: %s", exc)
     return out
 
 
@@ -522,22 +868,27 @@ class ImageStore:
         self.client = client
         self.dir = cfg.out_dir / "assets" / "img"
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._memo: dict[str, str | None] = {}
 
     def fetch(self, original: str, fallback: str) -> str | None:
         """Baixa a imagem e devolve o caminho LOCAL relativo (nunca a URL)."""
+        if original in self._memo:                       # tambem memoriza falhas
+            return self._memo[original]
         name = safe_filename(unquote(urlparse(original).path.rsplit("/", 1)[-1]))
         dest = self.dir / name
-        rel = f"assets/img/{name}"
-        if dest.exists() and dest.stat().st_size > 0:
-            return rel
-        for url in dict.fromkeys((original, fallback)):
-            data = self.client.download(url)
-            if data:
-                tmp = dest.with_name(dest.name + ".part")
-                tmp.write_bytes(data)
-                tmp.replace(dest)
-                return rel
-        return None
+        rel: str | None = f"assets/img/{name}"
+        if not (dest.exists() and dest.stat().st_size > 0):
+            rel = None
+            for url in dict.fromkeys((original, fallback)):
+                data = self.client.download(url)
+                if data:
+                    tmp = dest.with_name(dest.name + ".part")
+                    tmp.write_bytes(data)
+                    tmp.replace(dest)
+                    rel = f"assets/img/{name}"
+                    break
+        self._memo[original] = rel
+        return rel
 
 
 # --------------------------------------------------------------------------- #
@@ -556,6 +907,22 @@ class Crawler:
         self.queued: set[str] = set()
         self.records: list[dict] = []
 
+    # -- imagens ----------------------------------------------------------------
+    def resolver(self) -> Callable[[Any], str | None]:
+        """Funcao <img> -> caminho local (baixa na primeira vez). None se desativado/falhou."""
+        cfg, store = self.cfg, self.images
+
+        def resolve(img: Any) -> str | None:
+            src = img.get("src") or ""
+            if store is None or not src or src.startswith("data:"):
+                return None
+            full = urljoin(cfg.site_root + "/", src)
+            orig = to_original_url(full)
+            if unquote(urlparse(orig).path.rsplit("/", 1)[-1]) in cfg.ignore_images:
+                return None
+            return store.fetch(orig, full)
+        return resolve
+
     # -- fila -----------------------------------------------------------------
     def enqueue(self, title: str, parent_crumbs: list[str]) -> None:
         key = norm(title)
@@ -567,13 +934,18 @@ class Crawler:
         cfg = self.cfg
         only = {s.lower() for s in cfg.only_sections}
         self.visited.add(norm(cfg.main_page))
-        for section, targets in self.client.sidebar_sections().items():
-            if only and section.lower() not in only:
+        main = self.client.parse_page(cfg.main_page)
+        sections = home_sections(main["text"], cfg)
+        if len([k for k in sections if k != cfg.home_label]) < 3:
+            log.warning("poucas secoes na pagina inicial (%d); usando a sidebar", len(sections))
+            sections = self.client.sidebar_sections() or sections
+        log.info("secoes: %s", {k: len(v) for k, v in sections.items()})
+        for label, targets in sections.items():
+            if only and label.lower() not in only:
                 continue
             for t in targets:
-                self.enqueue(t, [section])
+                self.enqueue(t, [label])
         if not only:
-            main = self.client.parse_page(cfg.main_page)
             for t in extract_links(make_soup(main["text"]), cfg):
                 self.enqueue(t, [cfg.home_label])
         log.info("fila inicial: %d paginas", len(self.queue))
@@ -588,56 +960,64 @@ class Crawler:
         if self.cfg.refresh or not f.exists():
             return None
         try:
-            return json.loads(f.read_text(encoding="utf-8"))
+            rec = json.loads(f.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
+        return rec if rec.get("_schema") == SCHEMA_VERSION else None   # formato antigo: refaz
 
     # -- processamento de uma pagina -------------------------------------------
     def build_record(self, parsed: dict, parent_crumbs: list[str]) -> dict:
         cfg = self.cfg
+        resolve = self.resolver()
         title = norm(parsed["title"])
         html = parsed["text"]
         soup = make_soup(html)
         children = extract_links(make_soup(html, drop_see_also=True), cfg)
 
-        box = find_infobox(soup)
-        refs = collect_images(box, cfg) if box else []
-        refs += [r for r in collect_images(soup, cfg) if r not in refs]
-
+        # 1) infobox -> atributos; a imagem principal vai para a lista da pagina
+        images: list[str] = []
         attrs: dict[str, Any] = {}
+        box = find_infobox(soup)
         if box is not None:
+            for im in box.find_all("img"):
+                if not icon_like(im) and (p := resolve(im)) and p not in images:
+                    images.append(p)
             attrs = parse_infobox(box, title)
             box.decompose()
-        is_item = len(attrs) >= 2
+        core = [k for k in attrs if k not in ("Description", "Classification", "Extras")]
+        is_item = len(core) >= 2
 
-        tables = parse_wikitables(soup)
+        # 2) tabelas -> lista de objetos (imagens das celulas sao baixadas aqui)
+        tables = parse_tables(soup, resolve, cfg)
         for t in soup.find_all("table"):
             if not t.decomposed:
                 t.decompose()
+
+        # 3) imagens do corpo (fora de tabelas e sem icones)
+        for im in soup.find_all("img"):
+            if not icon_like(im) and (p := resolve(im)) and p not in images:
+                images.append(p)
+
+        # 4) texto, metadados e templates do wikitext
         text, meta = extract_text(soup)
         for k, v in meta.items():
             put(attrs, k, v)
         if tables:
             attrs["tabelas"] = tables
-        if not is_item:
-            tpls = wikitext_templates(parsed.get("wikitext", ""))
-            if tpls:
-                attrs["_wikitext_templates"] = tpls
+        tpls = wikitext_templates(parsed.get("wikitext", ""))
+        if tpls:
+            attrs["_wikitext_templates"] = tpls
         if not text and parsed.get("wikitext"):
-            text = mwparserfromhell.parse(parsed["wikitext"]).strip_code().strip()
+            try:
+                text = mwparserfromhell.parse(parsed["wikitext"]).strip_code().strip()
+            except Exception:                            # noqa: BLE001
+                text = ""
 
-        images = []
-        if self.images:
-            for orig, fb in refs:
-                path = self.images.fetch(orig, fb)
-                if path and path not in images:
-                    images.append(path)
-
-        crumbs = parent_crumbs + [title]
         if is_item and not cfg.expand_leaves:
             children = []
         return {
-            "breadcrumbs": crumbs,
+            "_schema": SCHEMA_VERSION,
+            "breadcrumbs": parent_crumbs + [title],
             "titulo": title,
             "conteudo_texto": text,
             "dados_estruturados": attrs,
@@ -663,6 +1043,30 @@ class Crawler:
         f = self._page_file(real)
         f.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
         return record
+
+    # -- modo de depuracao: so as paginas pedidas, com dump do HTML/wikitext --------
+    def run_pages(self, titles: list[str]) -> None:
+        dbg = self.cfg.out_dir / "debug"
+        dbg.mkdir(exist_ok=True)
+        for raw in titles:
+            title = norm(raw)
+            try:
+                parsed = self.client.parse_page(title)
+            except WikiApiError as exc:
+                log.warning("pulando %s (%s)", title, exc)
+                continue
+            slug = re.sub(r"[^\w\-.'() ]+", "_", parsed["title"]).strip().replace(" ", "_")[:100]
+            (dbg / f"{slug}.html").write_text(parsed["text"], encoding="utf-8")
+            (dbg / f"{slug}.wikitext").write_text(parsed.get("wikitext", ""), encoding="utf-8")
+            rec = self.build_record(parsed, [norm(parsed["title"])])
+            self._page_file(norm(parsed["title"])).write_text(
+                json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+            a = rec["dados_estruturados"]
+            log.info("%s: tipo=%s atributos=%s tabelas=%s imagens=%d", rec["titulo"],
+                     rec["tipo_pagina"], [k for k in a if not k.startswith("_") and k != "tabelas"],
+                     [(t["tipo"], len(t.get("linhas", t.get("celulas", [])))) for t in
+                      a.get("tabelas", [])], len(rec["imagens"]))
+        log.info("dumps em %s e registros em %s", dbg, self.cfg.out_dir / "pages")
 
     # -- loop principal -----------------------------------------------------------
     def run(self) -> None:
@@ -711,7 +1115,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-depth", type=int, default=6)
     ap.add_argument("--max-pages", type=int, default=0, help="0 = sem limite")
     ap.add_argument("--section", action="append", default=[],
-                    help="restringe a uma secao da sidebar (repetivel), ex.: Gear")
+                    help="restringe a uma secao da pagina inicial (repetivel), ex.: Gear")
+    ap.add_argument("--page", action="append", default=[],
+                    help="processa so esta pagina e salva dump do HTML/wikitext (repetivel)")
     ap.add_argument("--expand-leaves", action="store_true")
     ap.add_argument("--no-images", action="store_true")
     ap.add_argument("--refresh", action="store_true", help="ignora paginas ja salvas")
@@ -722,8 +1128,8 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = Config(site_root=a.site_root, wiki_path=a.wiki_path, out_dir=a.out, delay=a.delay,
                  max_depth=a.max_depth, max_pages=a.max_pages, only_sections=a.section,
-                 expand_leaves=a.expand_leaves, download_images=not a.no_images,
-                 refresh=a.refresh)
+                 only_pages=a.page, expand_leaves=a.expand_leaves,
+                 download_images=not a.no_images, refresh=a.refresh)
     if a.user_agent:
         cfg.user_agent = a.user_agent
     a.out.mkdir(parents=True, exist_ok=True)
@@ -731,7 +1137,11 @@ def main(argv: list[str] | None = None) -> int:
                         handlers=[logging.StreamHandler(sys.stdout),
                                   logging.FileHandler(a.out / "crawl.log", encoding="utf-8")])
     try:
-        Crawler(cfg).run()
+        crawler = Crawler(cfg)
+        if cfg.only_pages:
+            crawler.run_pages(cfg.only_pages)
+        else:
+            crawler.run()
     except KeyboardInterrupt:
         log.warning("interrompido; paginas ja salvas em %s/pages permitem retomar", a.out)
         return 130
