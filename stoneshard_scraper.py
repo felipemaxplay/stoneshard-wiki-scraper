@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Stoneshard Wiki -> base de dados local em JSON (+ imagens).      [patch 1.1]
+Stoneshard Wiki -> base de dados local em JSON (+ imagens).      [patch 1.2]
 
 Fluxo:
   1. Detecta o api.php da wiki (MediaWiki 1.45.x em stoneshard.com/wiki).
@@ -49,7 +49,7 @@ log = logging.getLogger("stoneshard")
 
 # Versao do formato dos registros. Registros salvos com outra versao sao
 # reprocessados (o cache de output/pages e invalidado automaticamente).
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # --------------------------------------------------------------------------- #
 # Configuracao e constantes
@@ -70,6 +70,7 @@ class Config:
     expand_leaves: bool = False      # True = tambem segue links de paginas de item
     download_images: bool = True
     refresh: bool = False            # ignora cache de paginas ja salvas
+    refine_breadcrumbs: bool = True  # pai = pagina cuja tabela lista a pagina (ver refine_breadcrumbs)
     home_label: str = "Stoneshard Wiki"
     user_agent: str = ("StoneshardOfflineArchiver/1.1 "
                        "(arquivo pessoal offline; contato: voce@exemplo.com)")
@@ -117,6 +118,12 @@ DAMAGE_LINE_RE = re.compile(r"^(?:\d+(?:\.\d+)?\s+[A-Za-z]+\s+Damage\s*)+$", re.
 PAIR_RE = re.compile(r"([A-Za-z][A-Za-z '’/&-]*?):\s*([+\-−]?\d[\d.,/]*%?)")
 THUMB_RE = re.compile(r"/images/thumb/([0-9a-f]/[0-9a-f]{2})/([^/]+)/[^/]+$")
 THUMB_W_RE = re.compile(r"/(\d+)px-[^/]+$")
+# Rotulo de bloco recolhivel: 'Show formulasHide formulas' (dois botoes colados).
+# So casa o PAR Show/Hide, para nao apagar frases normais como 'Hide in Shadows'.
+TOGGLE_PAIR_RE = re.compile(
+    r"^(?:Show|Expand)\s+([A-Za-z ]{2,24}?)\s*(?:Hide|Collapse)\s+[A-Za-z ]{2,24}$")
+TOGGLE_SINGLE_RE = re.compile(r"^(?:Show|Hide|Expand|Collapse)\s+[A-Za-z]{2,24}$")
+STUB_RE = re.compile(r"^This article is a stub\b", re.I)
 
 # Marcadores de icone dentro de linhas de texto (nao ocorrem em texto normal)
 ICON_L, ICON_R = "⟦", "⟧"
@@ -126,6 +133,26 @@ TRAILING_ICON_VALUE_RE = re.compile(
 BLOCK_TAGS = {"p", "div", "tr", "td", "th", "table", "ul", "ol", "li", "dl", "dt", "dd",
               "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "hr", "caption", "thead",
               "tbody", "tfoot", "section", "center", "pre"}
+# Tags que dao o 'tipo' da linha (titulo / item de lista); as demais contam como paragrafo
+KIND_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "dd", "dt"}
+# '10 ⟦energia⟧ 8 ⟦cooldown⟧' ou '⟦Price⟧ 475': numero colado a um icone (qualquer ordem)
+VALUE_ICON_RE = re.compile(
+    f"(?:(\\d+(?:\\.\\d+)?%?)\\s*{ICON_L}([^{ICON_R}]+){ICON_R}"
+    f"|{ICON_L}([^{ICON_R}]+){ICON_R}\\s*(\\d+(?:\\.\\d+)?%?))")
+REQ_RE = re.compile(r"^-?\s*(Requires?\b.+)$")
+# Rotulos curtos que aparecem SEM dois-pontos, com o valor na linha seguinte
+# (ficha de skill: 'Type' / 'Target Object', 'Range' / '1', 'Modified by' / '...')
+STAT_LABELS = {"type", "range", "modified by", "energy", "energy cost", "cooldown",
+               "requirement", "requirements", "duration", "area", "radius", "target",
+               "cast time", "charges", "uses"}
+# Nomes de icones de ficha -> rotulo (iguala 'Energy'/'Cooldown' das tabelas de skills)
+ICON_LABELS = {"energycost": "Energy", "energy cost": "Energy", "energy": "Energy",
+               "cooldown": "Cooldown", "cooldown turns": "Cooldown"}
+# Formula de atributos: '+(AGL + PRC)%', '+(STR)%', '(STR + 5)'
+FORMULA_RE = re.compile(
+    r"\(\s*[A-Z]{2,4}\s*(?:[+\-*/]\s*[A-Z0-9.]{1,4}\s*)*\)\s*%"
+    r"|\(\s*[A-Z]{2,4}\s*(?:[+\-*/]\s*[A-Z0-9.]{1,4}\s*)+\)")
+CORE_SKIP = ("Description", "Classification", "Extras")
 
 
 # --------------------------------------------------------------------------- #
@@ -427,34 +454,61 @@ def icon_like(img: Any) -> bool:
 # Parsing de HTML: linhas logicas, infobox, tabelas
 # --------------------------------------------------------------------------- #
 
-def logical_lines(el: Any) -> list[str]:
+def tag_flags(tag: Any) -> frozenset:
+    """Pistas de visibilidade/formula de um elemento: 'formula', 'hidden', 'collapsible'."""
+    cls = " ".join(tag.get("class") or []).lower()
+    ident = (tag.get("id") or "").lower()
+    style = re.sub(r"\s+", "", (tag.get("style") or "").lower())
+    flags = set()
+    if "formula" in cls or "formula" in ident:
+        flags.add("formula")
+    if "display:none" in style or "hidden" in cls or "mw-collapsed" in cls:
+        flags.add("hidden")
+    if "mw-collapsible" in cls or tag.get("data-expandtext") or tag.get("data-collapsetext"):
+        flags.add("collapsible")
+    return frozenset(flags)
+
+
+def logical_lines_ex(el: Any) -> list[tuple[str, str, frozenset]]:
     """
-    Quebra um elemento em 'linhas logicas': tags de bloco (div, tr, td, li, br...)
-    separam linhas; tags inline (span, a, b, i...) sao concatenadas. Imagens viram
-    marcadores ⟦alt⟧ (alt ou nome do arquivo), para que o icone nao se perca.
+    Quebra um elemento em 'linhas logicas' (tipo, texto, pistas): tags de bloco (div, tr, td,
+    li, br...) separam linhas; tags inline (span, a, b, i...) sao concatenadas. Funciona com
+    qualquer markup (div/span sem <p>/<li>/<table>). Imagens viram marcadores ⟦alt⟧ (alt ou
+    nome do arquivo). 'tipo' e a tag mais proxima entre titulo (h1-h6) / li / blockquote,
+    senao 'p'. 'pistas' reune as flags de tag_flags() dos ancestrais do texto.
     """
-    lines: list[str] = []
-    buf: list[str] = []
+    out: list[tuple[str, str, frozenset]] = []
+    buf: list[tuple[str, frozenset]] = []
+    kinds: list[str] = []
+    fstack: list[frozenset] = [frozenset()]
+
+    def kind() -> str:
+        for k in reversed(kinds):
+            if k in KIND_TAGS:
+                return k
+        return "p"
 
     def flush() -> None:
-        txt = re.sub(r"\s+", " ", "".join(buf).replace("\xa0", " ")).strip()
+        parts = list(buf)
         buf.clear()
+        txt = re.sub(r"\s+", " ", "".join(t for t, _ in parts).replace("\xa0", " ")).strip()
         if txt and set(txt) - set("-–—|"):
-            lines.append(txt)
+            flags = frozenset().union(*(f for _, f in parts)) if parts else frozenset()
+            out.append((kind(), txt, flags))
 
     def walk(node: Any) -> None:
         for c in node.children:
             if isinstance(c, Comment):
                 continue
             if isinstance(c, NavigableString):
-                buf.append(str(c))
+                buf.append((str(c), fstack[-1]))
                 continue
             name = c.name
-            if name in ("script", "style"):
+            if name in ("script", "style", "noscript"):
                 continue
             if name == "img":
                 alt = (c.get("alt") or "").strip() or img_name(c)
-                buf.append(f" {ICON_L}{alt}{ICON_R} ")
+                buf.append((f" {ICON_L}{alt}{ICON_R} ", fstack[-1]))
                 continue
             if name == "br":
                 flush()
@@ -462,13 +516,40 @@ def logical_lines(el: Any) -> list[str]:
             block = name in BLOCK_TAGS
             if block:
                 flush()
+            kinds.append(name)
+            fstack.append(fstack[-1] | tag_flags(c))
             walk(c)
             if block:
                 flush()
+            kinds.pop()
+            fstack.pop()
 
     walk(el)
     flush()
-    return lines
+    return out
+
+
+def logical_lines(el: Any) -> list[str]:
+    """Versao simples de logical_lines_ex: so os textos."""
+    return [t for _, t, _ in logical_lines_ex(el)]
+
+
+def undouble(text: str) -> str:
+    """'Double LungeDouble Lunge' -> 'Double Lunge' (mesmo texto colado duas vezes, sem espaco)."""
+    t = text.strip()
+    half, odd = divmod(len(t), 2)
+    if not odd and half >= 5 and t[:half] == t[half:]:
+        return t[:half]
+    return t
+
+
+def icon_label(alt: str) -> str:
+    """'Icon skill energycost' -> 'Energy'; 'Icon_skill_cooldown' -> 'Cooldown'; 'Price' fica."""
+    a = alt.strip()
+    if re.match(r"(?i)icon(?=[ _])", a):
+        a = re.sub(r"(?i)^icon[ _]+(skill[ _]+)?", "", a).replace("_", " ").strip()
+        return ICON_LABELS.get(a.lower(), a.title())
+    return ICON_LABELS.get(a.lower(), a)
 
 
 def resolve_icons(line: str) -> str:
@@ -479,7 +560,7 @@ def resolve_icons(line: str) -> str:
     """
     m = re.match(f"^{ICON_L}(.*?){ICON_R}\\s*(.*)$", line)
     if m:
-        alt, rest = m.group(1).strip(), m.group(2).strip()
+        alt, rest = icon_label(m.group(1)), m.group(2).strip()
         if not rest or ICON_L in rest and not ICON_RE.sub("", rest).strip():
             return ""
         bare = ICON_RE.sub("", rest).strip()
@@ -491,7 +572,7 @@ def resolve_icons(line: str) -> str:
     plain = ICON_RE.sub(" ", line).lower()               # texto da linha sem marcadores
 
     def repl(mm: re.Match) -> str:
-        alt = mm.group(1).strip()
+        alt = icon_label(mm.group(1))
         return f" {alt} " if alt and alt.lower() not in plain else " "
     return re.sub(r"\s+", " ", ICON_RE.sub(repl, line)).strip()
 
@@ -504,7 +585,15 @@ def interpret_lines(lines: list[str], title: str, attrs: dict) -> list[str]:
       '+5% Armor Penetration'       -> Armor Penetration: '+5%'
     """
     expanded: list[str] = []
-    for ln in lines:                       # 'descricao... ⟦Price⟧ 475' -> 2 linhas
+    for ln in lines:
+        # '10 ⟦Icon skill energycost⟧ 8 ⟦Icon skill cooldown⟧' -> Energy: 10, Cooldown: 8
+        pairs = VALUE_ICON_RE.findall(ln)
+        rest_txt = re.sub(r"\bturns?\b", "", VALUE_ICON_RE.sub("", ln), flags=re.I)
+        if pairs and not rest_txt.strip(" \t·,|/-"):
+            for n1, a1, a2, n2 in pairs:
+                put(attrs, icon_label(a1 or a2), convert(n1 or n2))
+            continue
+        # 'descricao... ⟦Price⟧ 475' -> 2 linhas
         m = TRAILING_ICON_VALUE_RE.match(ln)
         expanded += [m.group(1), f"{ICON_L}{m.group(2)}{ICON_R} {m.group(3)}"] if m else [ln]
     queue = [resolve_icons(ln) for ln in expanded]
@@ -525,6 +614,15 @@ def interpret_lines(lines: list[str], title: str, attrs: dict) -> list[str]:
                     rest = rest[len(title):].strip()
                 if rest:
                     queue.insert(i, rest)
+            continue
+        if (ln.rstrip(":").strip().lower() in STAT_LABELS and i < len(queue)
+                and not queue[i].endswith(":")
+                and queue[i].rstrip(":").strip().lower() not in STAT_LABELS):
+            put(attrs, ln.rstrip(":").strip(), convert(queue[i]))     # 'Range' / '1'
+            i += 1
+            continue
+        if m := REQ_RE.match(ln):                       # '- Requires a dagger'
+            put(attrs, "Requirement", m.group(1))
             continue
         if ln.endswith(":") and i < len(queue) and not queue[i].endswith(":"):
             put(attrs, ln[:-1], convert(queue[i]))
@@ -601,7 +699,13 @@ def parse_infobox(box: Any, title: str) -> dict[str, Any]:
                 put(attrs, k.rstrip(":"), convert(v))
                 tr.decompose()
 
-    leftovers = interpret_lines(logical_lines(box), title, attrs)
+    return attrs_from_lines(logical_lines(box), title, attrs)
+
+
+def attrs_from_lines(lines: list[str], title: str, attrs: dict | None = None) -> dict[str, Any]:
+    """Linhas logicas -> atributos (pares) + Description / Classification / Extras das sobras."""
+    attrs = {} if attrs is None else attrs
+    leftovers = interpret_lines(lines, title, attrs)
     leftovers = [ln for ln in leftovers if ln.lower() != title.lower()]
     desc = [ln for ln in leftovers if len(ln) > 40 or ln.endswith(".") or len(ln.split()) >= 6]
     short = [ln for ln in leftovers if ln not in desc]
@@ -617,6 +721,71 @@ def parse_infobox(box: Any, title: str) -> dict[str, Any]:
     return attrs
 
 
+def is_prose(text: str) -> bool:
+    """Frase de texto corrido (e nao rotulo/valor de ficha)."""
+    t = ICON_RE.sub("", text).strip()
+    return len(t) > 80 or t.endswith((".", "!", "?")) or len(t.split()) >= 9
+
+
+def is_heading(kind: str) -> bool:
+    return len(kind) == 2 and kind[0] == "h" and kind[1].isdigit()
+
+
+def leading_block(lines: list[tuple[str, str, frozenset]], title: str):
+    """
+    Ficha 'solta' (sem <table>): linhas curtas logo no inicio da pagina, antes da 1a frase de
+    texto corrido ou titulo. Ex.: 'Double Lunge' / 'Attack' / '10 ⟦energia⟧ 8 ⟦cooldown⟧' /
+    'Type' / 'Target Object' / 'Range' / '1'. So vale se render >= 2 atributos.
+    Devolve (atributos, linhas_restantes).
+    """
+    seg: list[str] = []
+    for kind, text, _ in lines:
+        if is_heading(kind) or is_prose(text) or META_RE.search(text) or is_toggle(text, ()):
+            break
+        seg.append(text)
+    if len(seg) < 2:
+        return {}, lines
+    attrs = attrs_from_lines(seg, title)
+    if len([k for k in attrs if k not in CORE_SKIP]) < 2:
+        return {}, lines
+    return attrs, lines[len(seg):]
+
+
+def is_toggle(text: str, flags: Any) -> bool:
+    """'Show formulasHide formulas' (par) ou 'Show formulas' dentro de bloco recolhivel."""
+    t = ICON_RE.sub(" ", text).strip()
+    return bool(TOGGLE_PAIR_RE.match(t) or ("collapsible" in flags and TOGGLE_SINGLE_RE.match(t)))
+
+
+def toggle_label(text: str) -> str:
+    m = TOGGLE_PAIR_RE.match(ICON_RE.sub(" ", text).strip())
+    return m.group(1).strip() if m else ""
+
+
+def is_formula(text: str, flags: Any, has_toggle: bool) -> bool:
+    return ("formula" in flags or bool(FORMULA_RE.search(text))
+            or (has_toggle and "hidden" in flags))
+
+
+def split_description(head: list[tuple[str, str, frozenset]], has_toggle: bool):
+    """
+    Separa a descricao numerica da versao com formulas ('+(AGL + PRC)% Weapon Damage').
+    Caso tipico da wiki: [numerica, resto, formula, resto] -> (metade 1, metade 2).
+    Devolve (descricao, formulas), listas de frases.
+    """
+    texts = [re.sub(r"\s+", " ", ICON_RE.sub(" ", t)).strip() for _, t, _ in head]
+    isf = [is_formula(t, f, has_toggle) for (_, _, f), t in zip(head, texts)]
+    if not any(isf):
+        return texts, []
+    n = len(texts)
+    if n >= 2 and n % 2 == 0:
+        a, b, fb = texts[:n // 2], texts[n // 2:], isf[n // 2:]
+        if not any(isf[:n // 2]) and any(fb) and all(x == y or f for x, y, f in zip(a, b, fb)):
+            return a, b
+    keep = list(dict.fromkeys(t for t, f in zip(texts, isf) if not f))
+    return keep, [t for t, f in zip(texts, isf) if f]
+
+
 # -- tabelas ------------------------------------------------------------------
 
 def cell_texts(cell: Any) -> tuple[list[str], list[str]]:
@@ -624,7 +793,7 @@ def cell_texts(cell: Any) -> tuple[list[str], list[str]]:
     texts, icons = [], []
     for ln in logical_lines(cell):
         icons += [x.strip() for x in ICON_RE.findall(ln) if x.strip()]
-        t = re.sub(r"\s+", " ", ICON_RE.sub(" ", ln)).strip()
+        t = undouble(re.sub(r"\s+", " ", ICON_RE.sub(" ", ln)).strip())
         if t:
             texts.append(t)
     return texts, icons
@@ -644,6 +813,8 @@ def shape_value(texts: list[str], icons: list[str], header: str) -> Any:
     h = header.lower()
     if not texts:
         return icons[0] if len(icons) == 1 else icons
+    if "description" in h:                       # frases inteiras: nunca virar chave/valor
+        return texts[0] if len(texts) == 1 else texts
     if "damage" in h:
         return normalize_damage(" ".join(texts))
     if h == "tier" and len(texts) == 1 and (m := TIER_RE.match(texts[0])):
@@ -654,6 +825,9 @@ def shape_value(texts: list[str], icons: list[str], header: str) -> Any:
         attrs: dict[str, Any] = {}
         left = interpret_lines(list(texts), "", attrs)
         if attrs and (stat_col or len(attrs) >= len(texts) / 2):
+            if left and len(left[0]) <= 40 and not left[0].endswith("."):
+                put(attrs, "Classification", left[0])     # 'Attack', 'Passive', 'Stance'
+                left = left[1:]
             if left:
                 attrs["_outros"] = left
             return attrs
@@ -804,35 +978,44 @@ def parse_tables(root: Any, resolver: Callable[[Any], str | None], cfg: Config) 
     return out
 
 
-def _own_text(el: Any) -> str:
-    """Texto de um <li>/<p> sem o de listas aninhadas."""
-    parts = []
-    for c in el.children:
-        if getattr(c, "name", None) in ("ul", "ol", "dl"):
-            continue
-        parts.append(c.get_text() if hasattr(c, "get_text") else str(c))
-    return re.sub(r"\s+", " ", "".join(parts).replace("\xa0", " ")).strip()
-
-
-def extract_text(root: Any) -> tuple[str, dict[str, str]]:
+def prepare_lines(root: Any) -> tuple[list[tuple[str, str, frozenset]], dict[str, str], bool]:
+    """
+    Linhas logicas do corpo da pagina (qualquer markup), ja sem ruido:
+    remove metadados ('Page last edited during patch: ...', devolvidos em `meta`), o aviso de
+    stub e os botoes 'Show formulasHide formulas' (`has_toggle` avisa que existiam).
+    """
     meta: dict[str, str] = {}
-    lines: list[str] = []
-    for el in root.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "dd", "blockquote"]):
-        txt = _own_text(el)
-        if not txt:
-            continue
-        for k, v in META_RE.findall(txt):
+    out: list[tuple[str, str, frozenset]] = []
+    has_toggle = False
+    for kind, text, flags in logical_lines_ex(root):
+        plain = re.sub(r"\s+", " ", ICON_RE.sub(" ", text)).strip()
+        for k, v in META_RE.findall(plain):
             meta[k] = v
-        txt = META_RE.sub("", txt).strip(" |")
+        if META_RE.sub("", plain).strip(" |") == "" and META_RE.search(plain):
+            continue
+        if STUB_RE.match(plain):
+            continue
+        if is_toggle(text, flags):
+            has_toggle = True
+            continue
+        out.append((kind, text, flags))
+    return out, meta, has_toggle
+
+
+def render_text(lines: list[tuple[str, str, frozenset]]) -> str:
+    """Linhas logicas -> texto limpo (titulos '## ', listas '- '); icones sao removidos."""
+    rows: list[str] = []
+    for kind, text, _ in lines:
+        txt = re.sub(r"\s+", " ", ICON_RE.sub(" ", text)).strip(" |")
         if not txt:
             continue
-        if el.name[0] == "h" and el.name[1:].isdigit():
-            lines.append(f"\n{'#' * int(el.name[1])} {txt}")
-        elif el.name == "li":
-            lines.append(f"- {txt}")
+        if is_heading(kind):
+            rows.append(f"\n{'#' * int(kind[1])} {txt}")
+        elif kind == "li":
+            rows.append(f"- {txt}")
         else:
-            lines.append(txt)
-    return "\n".join(lines).strip(), meta
+            rows.append(txt)
+    return "\n".join(rows).strip()
 
 
 def wikitext_templates(wikitext: str) -> dict[str, dict[str, Any]]:
@@ -849,11 +1032,12 @@ def wikitext_templates(wikitext: str) -> dict[str, dict[str, Any]]:
                 val = mwparserfromhell.parse(str(p.value)).strip_code().strip()
                 if val:
                     params[str(p.name).strip()] = convert(val)
-            if params:
-                key, n = name, 2
-                while key in out:                        # mesmo template repetido
-                    key, n = f"{name}#{n}", n + 1
-                out[key] = params
+            # Templates sem parametros ({{Skill}}) ficam como {}: mostram qual template gera a
+            # pagina (os dados vem de uma Data Page / modulo, nao do wikitext).
+            key, n = name, 2
+            while key in out:                            # mesmo template repetido
+                key, n = f"{name}#{n}", n + 1
+            out[key] = params
     except Exception as exc:                             # noqa: BLE001 - wikitext atipico
         log.debug("wikitext_templates falhou: %s", exc)
     return out
@@ -889,6 +1073,59 @@ class ImageStore:
                     break
         self._memo[original] = rel
         return rel
+
+
+# --------------------------------------------------------------------------- #
+# Breadcrumbs: pai estrutural
+# --------------------------------------------------------------------------- #
+
+MAX_LISTING_ROWS = 200      # tabelas maiores que isso sao indices gerais, nao pais de verdade
+
+
+def refine_breadcrumbs(records: list[dict]) -> list[dict]:
+    """
+    O BFS monta o breadcrumb pelo 1o caminho que descobriu a pagina (ex.: 'Double Lunge' foi
+    achada via 'Combat Formulas'). Aqui o pai passa a ser a pagina cuja TABELA lista a pagina:
+    prefere tabela (linhas) a grade, depois a maior listagem, depois o caminho mais curto.
+    Guarda o antigo em 'breadcrumbs_origem'. Evita ciclos. Devolve os registros alterados.
+    """
+    by = {r["titulo"]: r for r in records}
+    cand: dict[str, list[tuple]] = {}
+    for r in records:
+        for t in r.get("dados_estruturados", {}).get("tabelas", []):
+            if t.get("tipo") == "tabela":
+                rows, rank = t["linhas"], 0
+                refs = [p for row in rows for p in row.get("_paginas", [])]
+            else:
+                rows, rank = t.get("celulas", []), 1
+                refs = [p for c in rows for p in c.get("paginas", [])]
+            if len(rows) > MAX_LISTING_ROWS:
+                continue
+            for p in dict.fromkeys(refs):
+                if p in by and p != r["titulo"]:
+                    cand.setdefault(p, []).append(
+                        (rank, -len(rows), len(r["breadcrumbs"]), r["titulo"]))
+
+    memo: dict[str, list[str]] = {}
+
+    def crumbs(title: str, seen: frozenset) -> list[str]:
+        if title in memo:
+            return memo[title]
+        options = sorted(c for c in cand.get(title, []) if c[3] not in seen and c[3] != title)
+        result = by[title]["breadcrumbs"]
+        if options:
+            result = crumbs(options[0][3], seen | {title}) + [title]
+        memo[title] = result
+        return result
+
+    changed = []
+    for r in records:
+        new = crumbs(r["titulo"], frozenset())
+        if new != r["breadcrumbs"]:
+            r.setdefault("breadcrumbs_origem", r["breadcrumbs"])
+            r["breadcrumbs"] = new
+            changed.append(r)
+    return changed
 
 
 # --------------------------------------------------------------------------- #
@@ -984,8 +1221,6 @@ class Crawler:
                     images.append(p)
             attrs = parse_infobox(box, title)
             box.decompose()
-        core = [k for k in attrs if k not in ("Description", "Classification", "Extras")]
-        is_item = len(core) >= 2
 
         # 2) tabelas -> lista de objetos (imagens das celulas sao baixadas aqui)
         tables = parse_tables(soup, resolve, cfg)
@@ -998,8 +1233,31 @@ class Crawler:
             if not icon_like(im) and (p := resolve(im)) and p not in images:
                 images.append(p)
 
-        # 4) texto, metadados e templates do wikitext
-        text, meta = extract_text(soup)
+        # 4) corpo em linhas logicas (qualquer markup: div/span, nao so <p>/<li>)
+        lines, meta, has_toggle = prepare_lines(soup)
+        sheet: dict[str, Any] = {}
+        if len([k for k in attrs if k not in CORE_SKIP]) < 2:
+            # sem infobox em tabela: tenta a ficha 'solta' em linhas (paginas de skill)
+            sheet, lines = leading_block(lines, title)
+            for k, v in sheet.items():
+                attrs.setdefault(k, v)
+        core = [k for k in attrs if k not in CORE_SKIP]
+        is_item = len(core) >= 2
+
+        # descricao: versao numerica x versao com formulas ('Show formulas')
+        head_n = next((i for i, (kd, _, _) in enumerate(lines) if is_heading(kd)), len(lines))
+        head, rest = lines[:head_n], lines[head_n:]
+        desc, formulas = split_description(head, has_toggle)
+        if formulas:
+            attrs["Formulas"] = formulas
+        if sheet and desc and "Description" not in attrs:
+            attrs["Description"] = " ".join(desc)
+        body = [("p", t, frozenset()) for t in desc]
+        if formulas:
+            body += [("h2", "Formulas", frozenset())] + [("p", t, frozenset()) for t in formulas]
+        text = render_text(body + rest)
+
+        # 5) metadados, tabelas e templates do wikitext
         for k, v in meta.items():
             put(attrs, k, v)
         if tables:
@@ -1098,6 +1356,12 @@ class Crawler:
         self.finish()
 
     def finish(self) -> None:
+        if self.cfg.refine_breadcrumbs:
+            changed = refine_breadcrumbs(self.records)
+            for rec in changed:                       # mantem o cache de paginas coerente
+                self._page_file(rec["titulo"]).write_text(
+                    json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+            log.info("breadcrumbs refinados pela tabela-pai: %d paginas", len(changed))
         self.records.sort(key=lambda r: r["breadcrumbs"])
         out = self.cfg.out_dir / "stoneshard_db.json"
         out.write_text(json.dumps(self.records, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1121,6 +1385,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--expand-leaves", action="store_true")
     ap.add_argument("--no-images", action="store_true")
     ap.add_argument("--refresh", action="store_true", help="ignora paginas ja salvas")
+    ap.add_argument("--no-refine-breadcrumbs", action="store_true",
+                    help="mantem o breadcrumb do 1o caminho descoberto (sem pai por tabela)")
     ap.add_argument("--site-root", default="https://stoneshard.com")
     ap.add_argument("--wiki-path", default="/wiki")
     ap.add_argument("--user-agent")
@@ -1129,7 +1395,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg = Config(site_root=a.site_root, wiki_path=a.wiki_path, out_dir=a.out, delay=a.delay,
                  max_depth=a.max_depth, max_pages=a.max_pages, only_sections=a.section,
                  only_pages=a.page, expand_leaves=a.expand_leaves,
-                 download_images=not a.no_images, refresh=a.refresh)
+                 download_images=not a.no_images, refresh=a.refresh,
+                 refine_breadcrumbs=not a.no_refine_breadcrumbs)
     if a.user_agent:
         cfg.user_agent = a.user_agent
     a.out.mkdir(parents=True, exist_ok=True)

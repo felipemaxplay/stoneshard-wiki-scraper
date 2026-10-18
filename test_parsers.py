@@ -164,6 +164,116 @@ def test_cache_schema(tmp=Path("/tmp/_stoneshard_cache")):
     assert c._read_cache("X")["titulo"] == "X"
 
 
+# --------------------------------------------------------------------------- patch 1.2
+# Pagina de skill como a wiki real entrega: sem <table>/<p>; tudo em <div> com linhas soltas,
+# rotulo e valor em linhas separadas, icones com numero, duas descricoes e botao Show/Hide.
+SKILL_PAGE = """<div class="mw-parser-output">
+<div>This article is a stub. You can help Stoneshard wiki by expanding it.</div>
+<div class="skill-box">
+ <div><img alt="" src="/wiki/images/thumb/1/1a/Double_Lunge.png/64px-Double_Lunge.png" width="64"></div>
+ <div>Double Lunge</div><div>Attack</div>
+ <div>10 <img alt="" src="/wiki/images/thumb/a/a1/Icon_skill_energycost.png/15px-Icon_skill_energycost.png"> 8 <img alt="" src="/wiki/images/thumb/b/b2/Icon_skill_cooldown.png/15px-Icon_skill_cooldown.png"></div>
+ <hr>
+ <div><div>Type</div><div>Target Object</div></div>
+ <div><div>Range</div><div>1</div></div>
+ <div><div>Modified by</div><div>Strength, Agility, Perception</div></div>
+ <ul><li>Requires a dagger</li></ul>
+</div>
+<div class="desc"><div>Delivers two strikes with +20% Weapon Damage and +10% Bodypart Damage.</div>
+ <div>If the skill kills its target or both strikes deal damage, reduces the skill's cooldown by 3 turns.</div></div>
+<div class="desc"><div>Delivers two strikes with +(AGL + PRC)% Weapon Damage and +(STR)% Bodypart Damage.</div>
+ <div>If the skill kills its target or both strikes deal damage, reduces the skill's cooldown by 3 turns.</div></div>
+<div class="mw-collapsible-toggle"><span>Show formulas</span><span>Hide formulas</span></div>
+<p><i>Page last edited during patch:</i> 0.8.0.27 | <i>Data Page last updated in:</i> 0.9.4.14</p></div>"""
+
+SKILL_TREE = """<h2>Skill List</h2><table class="wikitable"><tr><th>Skill</th><th>Basic Stats</th><th>Description</th></tr>
+<tr><td><a href="/wiki/Quick_Hands"><img alt="" src="/wiki/images/thumb/q/qh/Quick_Hands.png/40px-Quick_Hands.png"></a><a href="/wiki/Quick_Hands">Quick Hands</a></td>
+ <td><div>Passive</div><div>- Requires a dagger</div></td>
+ <td><div>Successful dagger strikes reduce the ability tree's cooldowns by 1 turn.</div><div>The effect doesn't stack.</div></td></tr>
+<tr><td><a href="/wiki/Double_Lunge"><img alt="Double Lunge" src="/wiki/images/thumb/1/1a/Double_Lunge.png/40px-Double_Lunge.png"></a><span>Double Lunge</span><span class="t">Double Lunge</span></td>
+ <td><div>Attack</div><div>Type: Target Object</div><div>Range: 1</div><div>Energy: 10</div><div>Cooldown: 8</div>
+     <div>Modified by: Strength, Agility, Perception</div><div>- Requires a dagger</div></td>
+ <td><div>Delivers two strikes with +20% Weapon Damage and +10% Bodypart Damage.</div>
+     <div>Gaping Wound: +33%</div></td></tr></table>"""
+
+
+def test_skill_page_sheet_and_formulas():
+    r = record(SKILL_PAGE, "Double Lunge", ["Weaponry Abilities", "Daggers (skill tree)"])
+    d = r["dados_estruturados"]
+    assert r["tipo_pagina"] == "item" and r["filhos"] == []
+    assert d["Classification"] == "Attack", d
+    assert d["Energy"] == 10 and d["Cooldown"] == 8, d
+    assert d["Type"] == "Target Object" and d["Range"] == 1, d
+    assert d["Modified by"] == "Strength, Agility, Perception", d
+    assert d["Requirement"] == "Requires a dagger", d
+    assert d["Description"] == ("Delivers two strikes with +20% Weapon Damage and +10% Bodypart "
+                                "Damage. If the skill kills its target or both strikes deal "
+                                "damage, reduces the skill's cooldown by 3 turns."), d["Description"]
+    assert d["Formulas"][0] == ("Delivers two strikes with +(AGL + PRC)% Weapon Damage and "
+                                "+(STR)% Bodypart Damage."), d["Formulas"]
+    assert len(d["Formulas"]) == 2 and "cooldown by 3 turns" in d["Formulas"][1]
+    assert d["Data Page last updated in"] == "0.9.4.14"
+    txt = r["conteudo_texto"]
+    assert "Show formulas" not in txt and "stub" not in txt.lower(), txt
+    assert "## Formulas" in txt and "+(AGL + PRC)%" in txt and "+20% Weapon Damage" in txt
+    assert r["imagens"] == ["assets/img/Double_Lunge.png"], r["imagens"]
+
+
+def test_hub_with_prose_is_not_a_sheet():
+    html = "<div><div>This page shows all Dagger skills.</div><div>Main focus: Bleeding</div><h2>Skill List</h2></div>"
+    r = record(html, "Daggers (skill tree)")
+    assert r["tipo_pagina"] == "hub" and "Classification" not in r["dados_estruturados"]
+    assert "This page shows all Dagger skills." in r["conteudo_texto"]
+    assert "Main focus: Bleeding" in r["conteudo_texto"]
+
+
+def test_normal_sentences_with_show_hide_are_kept():
+    r = record("<div><p>Hide in Shadows</p><p>Show your strength to the guards, or they will refuse you.</p></div>")
+    assert "Hide in Shadows" in r["conteudo_texto"] and "Show your strength" in r["conteudo_texto"]
+
+
+def test_skill_tree_table_names_and_cells():
+    tab = record(SKILL_TREE, "Daggers (skill tree)")["dados_estruturados"]["tabelas"][0]
+    quick, lunge = tab["linhas"]
+    assert quick["Skill"] == "Quick Hands"
+    assert lunge["Skill"] == "Double Lunge", lunge["Skill"]            # antes: 'Double LungeDouble Lunge'
+    assert lunge["Basic Stats"] == {"Type": "Target Object", "Range": 1, "Energy": 10,
+                                    "Cooldown": 8, "Modified by": "Strength, Agility, Perception",
+                                    "Requirement": "Requires a dagger", "Classification": "Attack"}, lunge["Basic Stats"]
+    assert quick["Basic Stats"] == {"Requirement": "Requires a dagger", "Classification": "Passive"}
+    assert lunge["Description"] == ["Delivers two strikes with +20% Weapon Damage and +10% Bodypart Damage.",
+                                    "Gaping Wound: +33%"]            # frases intactas, sem virar dict
+    assert quick["Description"][1] == "The effect doesn't stack."
+    assert lunge["_paginas"] == ["Double Lunge"] and lunge["_imagens"] == ["assets/img/Double_Lunge.png"]
+
+
+def test_undouble():
+    assert s.undouble("Double LungeDouble Lunge") == "Double Lunge"
+    assert s.undouble("Gaping WoundGaping Wound") == "Gaping Wound"
+    assert s.undouble("Bora Bora") == "Bora Bora" and s.undouble("Mama") == "Mama"
+    assert s.undouble("Coup de Grace") == "Coup de Grace"
+
+
+def test_refine_breadcrumbs():
+    def rec(title, crumbs, paginas=None, tipo="tabela"):
+        tabs = []
+        if paginas:
+            key = "linhas" if tipo == "tabela" else "celulas"
+            rows = [{"_paginas": [p]} if tipo == "tabela" else {"paginas": [p]} for p in paginas]
+            tabs = [{"titulo": "", "tipo": tipo, key: rows}]
+        return {"titulo": title, "breadcrumbs": list(crumbs), "dados_estruturados": {"tabelas": tabs}}
+    recs = [rec("Combat Formulas", ["Combat & Survival", "Combat Formulas"]),
+            rec("Daggers (skill tree)", ["Weaponry Abilities", "Daggers (skill tree)"], ["Double Lunge"]),
+            rec("Double Lunge", ["Combat & Survival", "Combat Formulas", "Double Lunge"]),
+            rec("A", ["X", "A"], ["B"]), rec("B", ["X", "A", "B"], ["A"])]            # ciclo
+    changed = s.refine_breadcrumbs(recs)
+    lunge = recs[2]
+    assert lunge["breadcrumbs"] == ["Weaponry Abilities", "Daggers (skill tree)", "Double Lunge"]
+    assert lunge["breadcrumbs_origem"] == ["Combat & Survival", "Combat Formulas", "Double Lunge"]
+    assert recs[0]["breadcrumbs"] == ["Combat & Survival", "Combat Formulas"]          # sem pai: intacto
+    assert all(len(r["breadcrumbs"]) < 8 for r in recs) and changed        # ciclo nao explode
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
