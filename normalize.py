@@ -122,7 +122,350 @@ def load_raw_pages(pages_dir: Path, warnings: Warnings) -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------- #
-# CLI (partes seguintes acrescentam a extracao de skills e os arquivos de saida)
+# Helpers gerais
+# --------------------------------------------------------------------------- #
+
+def as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def first(value: Any) -> Any:
+    items = as_list(value)
+    return items[0] if items else None
+
+
+def slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+TREE_SUFFIX = re.compile(r"\s*\(skill tree\)$", re.I)
+
+
+def tree_id(title: str) -> str:
+    return slug(TREE_SUFFIX.sub("", title))
+
+
+def attrs_of(data: dict[str, Any]) -> dict[str, Any]:
+    """Aceita os dois formatos: achatado (pagina) e 'Basic Stats' aninhado (linha de arvore)."""
+    basic = data.get("Basic Stats")
+    flat = {k: v for k, v in data.items() if k != "Basic Stats"}
+    if isinstance(basic, dict):
+        return {**flat, **basic}
+    if isinstance(basic, str):
+        flat.setdefault("Classification", basic)
+    return flat
+
+
+# --------------------------------------------------------------------------- #
+# Skills: constantes
+# --------------------------------------------------------------------------- #
+
+KNOWN_CLASSES = {"attack", "maneuver", "passive", "stance", "spell"}
+TARGET_TYPES = {"target object": "object", "target tile": "tile", "no target": "none"}
+ROMAN = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5}
+TREATISE_RE = re.compile(r"Treatise\s+([IVX]+)\b")
+SPLIT_RE = re.compile(r"(?=\bTo unlock this ability\b)|(?=\bUnlocked by reading\b)"
+                      r"|(?=\bPassive bonus:)")
+PASSIVE_RE = re.compile(r"^Passive bonus:?\s*(.*)$")
+UNLOCK_LEVEL = re.compile(r"reach level (\d+)")
+UNLOCK_POINTS = re.compile(r"at least (\d+) points in the following attributes: ([^.]+)\.")
+UNLOCK_TREATISE = re.compile(r"Unlocked by reading (.+?) Treatise ([IVX]+)")
+# Nome do stat logo apos o '%': so palavras com inicial maiuscula ('Counter Chance until...' -> 'Counter Chance')
+PCT_STAT_RE = re.compile(r"%\s*((?:[A-Z][A-Za-z'\-]*)(?:\s+(?:&|[A-Z][A-Za-z'\-]*)){0,3})")
+VAR_RE = re.compile(r"[A-Z][A-Za-z]*(?:[ \-][A-Z][A-Za-z]*)*")
+
+
+# --------------------------------------------------------------------------- #
+# Skills: entrada (paginas individuais e linhas das arvores)
+# --------------------------------------------------------------------------- #
+
+def is_skill_page(rec: dict[str, Any]) -> bool:
+    if rec.get("tipo_pagina") != "item":
+        return False
+    cls = first(attrs_of(rec.get("dados_estruturados", {})).get("Classification"))
+    return isinstance(cls, str) and cls.split("/")[0].strip().lower() in KNOWN_CLASSES
+
+
+def collect_tree_rows(raws: list[dict[str, Any]], warnings: Warnings) -> dict[str, dict[str, Any]]:
+    """Linhas 'Skill List' das paginas de arvore: skill -> arvore, treatise e atributos."""
+    rows: dict[str, dict[str, Any]] = {}
+    for rec in raws:
+        for tab in rec.get("dados_estruturados", {}).get("tabelas", []):
+            if tab.get("tipo") != "tabela" or "Skill" not in tab.get("colunas", []):
+                continue
+            for row in tab.get("linhas", []):
+                name = first(row.get("Skill"))
+                if not name:
+                    continue
+                key = slug(str(name))
+                if key in rows:
+                    warnings.add(key, "skill aparece em mais de uma arvore", rec["titulo"])
+                    continue
+                m = TREATISE_RE.search(str(row.get("_secao") or ""))
+                desc = row.get("Description") or []
+                rows[key] = {
+                    "name": str(name),
+                    "tree": tree_id(rec["titulo"]),
+                    "treatise": ROMAN.get(m.group(1)) if m else None,
+                    "attrs": attrs_of(row),
+                    "description": desc if isinstance(desc, list) else [desc],
+                    "source": rec["_source_file"],
+                }
+    return rows
+
+
+def page_lines(rec: dict[str, Any]) -> list[str]:
+    """Texto numerico da pagina (antes da secao '## Formulas')."""
+    lines: list[str] = []
+    for ln in (rec.get("conteudo_texto") or "").split("\n"):
+        if ln.startswith("## "):
+            break
+        if ln.strip():
+            lines.append(ln.strip())
+    return lines
+
+
+# --------------------------------------------------------------------------- #
+# Skills: texto, unlock e formulas
+# --------------------------------------------------------------------------- #
+
+def split_text(lines: list[str]) -> tuple[list[str], str | None, list[str]]:
+    """Separa efeitos, bonus passivo da arvore e frases de unlock (inclusive coladas na mesma linha)."""
+    effects: list[str] = []
+    unlock: list[str] = []
+    passive: str | None = None
+    expect_passive = False
+    for ln in lines:
+        for part in (p.strip() for p in SPLIT_RE.split(ln)):
+            if not part:
+                continue
+            if part.startswith("To unlock") or part.startswith("Unlocked by reading"):
+                unlock.append(part)
+            elif m := PASSIVE_RE.match(part):
+                if m.group(1).strip():
+                    passive = m.group(1).strip()
+                else:
+                    expect_passive = True
+            elif expect_passive:
+                passive, expect_passive = part, False
+            else:
+                effects.append(part)
+    return effects, passive, unlock
+
+
+def parse_unlock(text: str, skill_id: str, stats: StatIndex, warnings: Warnings) -> dict[str, Any] | None:
+    if not text:
+        return None
+    level = UNLOCK_LEVEL.search(text)
+    points = UNLOCK_POINTS.search(text)
+    treat = UNLOCK_TREATISE.search(text)
+    if not (level and points and treat):
+        warnings.add(skill_id, "unlock fora do padrao", text)
+        return None
+    attrs: list[str] = []
+    for raw in re.split(r",\s*|\s+or\s+|\s+and\s+", points.group(2)):
+        sid = stats.resolve(raw.strip())
+        if sid:
+            attrs.append(sid)
+        else:
+            warnings.add(skill_id, "atributo de unlock desconhecido", raw.strip())
+    return {
+        "treatise": {"tree": slug(treat.group(1)), "number": ROMAN.get(treat.group(2))},
+        "level": int(level.group(1)),
+        "attribute_points": {"min": int(points.group(1)), "attributes": attrs},
+    }
+
+
+def match_open(text: str, close: int) -> int:
+    """Indice do '(' que fecha o ')' em `close`; -1 se nao houver."""
+    depth = 0
+    for i in range(close, -1, -1):
+        if text[i] == ")":
+            depth += 1
+        elif text[i] == "(":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def formula_expr(text: str, pct: int) -> str | None:
+    """Expressao entre parenteses antes do '%' (inclui grupos somados: '(a) + (b)%')."""
+    j = pct - 1
+    while j >= 0 and text[j].isspace():
+        j -= 1
+    if j < 0 or text[j] != ")":
+        return None
+    start = None
+    while True:
+        open_ = match_open(text, j)
+        if open_ < 0:
+            return None
+        start = open_
+        k = open_ - 1
+        while k >= 0 and text[k].isspace():
+            k -= 1
+        if k >= 0 and text[k] in "+-*/":
+            m = k - 1
+            while m >= 0 and text[m].isspace():
+                m -= 1
+            if m >= 0 and text[m] == ")":
+                j = m
+                continue
+        break
+    return text[start:pct].strip()
+
+
+def parse_formulas(raw_lines: list[str], skill_id: str, stats: StatIndex,
+                   warnings: Warnings) -> list[dict[str, Any]]:
+    """'+(AGL + PRC)% Weapon Damage' -> {raw, expr, vars, stat}. Texto sem stat fica so no texto."""
+    out: list[dict[str, Any]] = []
+    for raw in raw_lines:
+        for m in PCT_STAT_RE.finditer(raw):
+            expr = formula_expr(raw, m.start())
+            if not expr:
+                continue
+            name = m.group(1).strip()
+            stat = stats.resolve(name)
+            if stat is None:
+                warnings.add(skill_id, "stat de formula desconhecido", {"stat": name, "raw": raw})
+                continue
+            vars_: list[str] = []
+            for v in VAR_RE.findall(expr):
+                vid = stats.resolve(v)
+                if vid:
+                    vars_.append(vid)
+                else:
+                    warnings.add(skill_id, "variavel de formula desconhecida", {"var": v, "raw": raw})
+            out.append({"raw": raw, "expr": expr, "vars": sorted(set(vars_)), "stat": stat})
+    return out
+
+
+def assign_formulas(effects: list[str], formulas: list[dict[str, Any]], stats: StatIndex):
+    """Liga cada formula ao efeito que cita o mesmo stat; sem efeito correspondente, fica na skill."""
+    result = [{"text": t, "formulas": []} for t in effects]
+    loose: list[dict[str, Any]] = []
+    for f in formulas:
+        label = stats.by_id[f["stat"]]["name"].lower()
+        hit = next((e for e in result if label in e["text"].lower()), None)
+        (hit["formulas"] if hit else loose).append(f)
+    return result, loose
+
+
+# --------------------------------------------------------------------------- #
+# Skills: montagem
+# --------------------------------------------------------------------------- #
+
+def build_skill(key: str, page: dict[str, Any] | None, row: dict[str, Any] | None,
+                stats: StatIndex, warnings: Warnings) -> dict[str, Any]:
+    attrs = {**(row["attrs"] if row else {}),
+             **(attrs_of(page.get("dados_estruturados", {})) if page else {})}
+    name = page["titulo"] if page else row["name"]
+
+    lines = page_lines(page) if page else row["description"]
+    effects_text, passive, unlock_parts = split_text([str(x) for x in lines])
+    unlock = parse_unlock(" ".join(unlock_parts), key, stats, warnings)
+
+    formula_lines = [str(x) for x in as_list(attrs.get("Formulas"))]
+    formulas = parse_formulas(formula_lines, key, stats, warnings)
+    effects, loose = assign_formulas(effects_text, formulas, stats)
+
+    tree = row["tree"] if row else None
+    if tree is None and unlock:
+        tree = unlock["treatise"]["tree"]
+    if tree is None and page:
+        crumb = next((c for c in page.get("breadcrumbs", [])
+                      if c.lower().endswith("(skill tree)")), None)
+        tree = tree_id(crumb) if crumb else None
+    if tree is None:
+        warnings.add(key, "arvore nao encontrada")
+
+    treatise = row["treatise"] if row and row["treatise"] else None
+    if treatise is None and unlock:
+        treatise = unlock["treatise"]["number"]
+    if treatise is None:
+        warnings.add(key, "treatise nao encontrado")
+
+    classes: list[str] = []
+    for part in str(first(attrs.get("Classification")) or "").split("/"):
+        token = part.strip().lower()
+        if token in KNOWN_CLASSES:
+            classes.append(token)
+        elif token:
+            warnings.add(key, "classificacao desconhecida", token)
+
+    cost = {"energy": first(attrs.get("Energy")), "cooldown": first(attrs.get("Cooldown"))}
+
+    target = None
+    ttype_raw = first(attrs.get("Type"))
+    if ttype_raw is not None or attrs.get("Range") is not None:
+        ttype = TARGET_TYPES.get(str(ttype_raw or "").strip().lower())
+        if ttype is None and ttype_raw is not None:
+            warnings.add(key, "tipo de alvo desconhecido", ttype_raw)
+        target = {"type": ttype, "range": first(attrs.get("Range"))}
+
+    requirements: list[dict[str, str]] = []
+    for req in as_list(attrs.get("Requirement")):
+        text = str(req).strip()
+        if m := re.fullmatch(r"Requires an? (\w+)", text):
+            requirements.append({"type": "weapon", "value": m.group(1).lower()})
+        elif re.fullmatch(r"Requires dual weapons", text):
+            requirements.append({"type": "weapon_setup", "value": "dual"})
+        else:
+            requirements.append({"type": "text", "value": text})
+            warnings.add(key, "requisito fora do padrao", text)
+
+    scales: list[str] = []
+    for item in as_list(attrs.get("Modified by")):
+        for part in str(item).split(","):
+            if not part.strip():
+                continue
+            sid = stats.resolve(part)
+            if sid:
+                scales.append(sid)
+            else:
+                warnings.add(key, "stat em Modified by desconhecido", part.strip())
+
+    return {
+        "id": key,
+        "name": str(name),
+        "tree": tree,
+        "treatise": treatise,
+        "classification": classes,
+        "cost": cost,
+        "target": target,
+        "scales_with": scales,
+        "requirements": requirements,
+        "unlock": unlock,
+        "passive_bonus": passive,
+        "effects": effects,
+        "formulas": loose,
+        "source": {"page": page["_source_file"] if page else None,
+                   "tree": row["source"] if row else None},
+    }
+
+
+def build_all(raws: list[dict[str, Any]], stats: StatIndex, warnings: Warnings) -> list[dict[str, Any]]:
+    rows = collect_tree_rows(raws, warnings)
+    pages: dict[str, dict[str, Any]] = {}
+    for rec in raws:
+        if not is_skill_page(rec):
+            continue
+        key = slug(rec["titulo"])
+        if key in pages:
+            warnings.add(key, "pagina de skill duplicada", rec["_source_file"])
+            continue
+        pages[key] = rec
+    skills = [build_skill(key, pages.get(key), rows.get(key), stats, warnings)
+              for key in sorted(set(pages) | set(rows))]
+    skills.sort(key=lambda s: (s["tree"] or "", s["treatise"] or 0, s["name"]))
+    return skills
+
+
+# --------------------------------------------------------------------------- #
+# CLI
 # --------------------------------------------------------------------------- #
 
 def main(argv: list[str] | None = None) -> int:
@@ -134,12 +477,20 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     warnings = Warnings()
 
+    if not a.pages.is_dir():
+        warnings.add(None, "pasta de raws nao encontrada", str(a.pages))
+
     stats = load_stats(a.data / "stats.json", warnings)
     raws = load_raw_pages(a.pages, warnings)
-    log.info("stats: %d ids, %d aliases; raws: %d", len(stats.by_id),
-             len(stats.alias_to_id), len(raws))
+    skills = build_all(raws, stats, warnings)
 
+    out = a.data / "skills.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(skills, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     warnings.write(a.data / "reports" / "normalize_warnings.json")
+
+    log.info("raws: %d; skills: %d; avisos: %d -> %s", len(raws), len(skills),
+             len(warnings.items), out)
     return 0
 
 
