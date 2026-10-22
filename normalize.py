@@ -468,6 +468,81 @@ def build_all(raws: list[dict[str, Any]], stats: StatIndex, warnings: Warnings) 
 # CLI
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Arvores (trees.json)
+# --------------------------------------------------------------------------- #
+
+PENALTY_RE = re.compile(r"([A-Z][A-Za-z\- ]*?)\s+([+\-−]\d+(?:\.\d+)?%?)")
+
+
+def passive_text(value: Any) -> str | None:
+    """Linha de arvore: 'Passive bonus' vem como texto ou como {'Passive bonus': texto}."""
+    if isinstance(value, dict):
+        value = value.get("Passive bonus")
+    value = first(value)
+    return str(value).strip() if value else None
+
+
+def build_trees(raws: list[dict[str, Any]], skills: list[dict[str, Any]],
+                stats: StatIndex, warnings: Warnings) -> list[dict[str, Any]]:
+    skills_by_tree: dict[str, list[dict[str, Any]]] = {}
+    for s in skills:
+        skills_by_tree.setdefault(s["tree"], []).append(s)
+
+    trees: list[dict[str, Any]] = []
+    for rec in raws:
+        tables = [t for t in rec.get("dados_estruturados", {}).get("tabelas", [])
+                  if t.get("tipo") == "tabela" and "Skill" in t.get("colunas", [])]
+        if not tables:
+            continue
+        tid = tree_id(rec["titulo"])
+        lines = page_lines(rec)
+
+        main_focus = None
+        penalty_text = None
+        for i, ln in enumerate(lines):
+            nxt = lines[i + 1] if i + 1 < len(lines) else None
+            if ln.lower() == "main focus:" and nxt:
+                main_focus = nxt
+            if ln.lower().endswith("penalty:") and nxt:
+                penalty_text = nxt
+
+        penalty = None
+        if penalty_text:
+            mods = []
+            for name, value in PENALTY_RE.findall(penalty_text):
+                sid = stats.resolve(name.strip())
+                num = float(value.replace("−", "-").rstrip("%"))
+                if sid:
+                    mods.append({"stat": sid, "value": num})
+                else:
+                    warnings.add(tid, "stat de penalidade de arvore desconhecido", name.strip())
+            penalty = {"text": penalty_text, "modifiers": mods}
+
+        passives = {p for t in tables for row in t.get("linhas", [])
+                    if (p := passive_text(row.get("Passive bonus")))}
+        passive: Any = None
+        if len(passives) == 1:
+            passive = passives.pop()
+        elif len(passives) > 1:
+            passive = sorted(passives)
+            warnings.add(tid, "passive bonus diferente entre linhas da arvore", passive)
+
+        members = sorted(skills_by_tree.get(tid, []),
+                         key=lambda s: (s["treatise"] or 0, s["name"]))
+        trees.append({
+            "id": tid,
+            "name": TREE_SUFFIX.sub("", rec["titulo"]),
+            "main_focus": main_focus,
+            "penalty": penalty,
+            "passive_bonus": passive,
+            "skills": [s["id"] for s in members],
+            "source": rec["_source_file"],
+        })
+    trees.sort(key=lambda t: t["id"])
+    return trees
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Normaliza o raw do scraper em data/")
     ap.add_argument("--pages", type=Path, default=Path("output/pages"))
@@ -484,9 +559,13 @@ def main(argv: list[str] | None = None) -> int:
     raws = load_raw_pages(a.pages, warnings)
     skills = build_all(raws, stats, warnings)
 
+    trees = build_trees(raws, skills, stats, warnings)
+
     out = a.data / "skills.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(skills, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (a.data / "trees.json").write_text(json.dumps(trees, ensure_ascii=False, indent=2) + "\n",
+                                       encoding="utf-8")
     warnings.write(a.data / "reports" / "normalize_warnings.json")
 
     log.info("raws: %d; skills: %d; avisos: %d -> %s", len(raws), len(skills),
