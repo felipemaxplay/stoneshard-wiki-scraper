@@ -146,7 +146,38 @@
                 "VIT",
                 "Vitality"
             ],
-            "notes": "Stat score. Per-point values not yet extracted (page not sent)."
+            "cap": {
+                "player": 30
+            },
+            "per_point": {
+                "max_energy": 4,
+                "energy_restoration_pct": 2
+            },
+            "milestones": {
+                "stacking": "cumulative",
+                "at": {
+                    "15": {
+                        "max_health": 15,
+                        "block_power_recovery_pct": 5,
+                        "control_resistance_pct": 7.5
+                    },
+                    "20": {
+                        "max_health": 15,
+                        "block_power_recovery_pct": 5,
+                        "control_resistance_pct": 7.5
+                    },
+                    "25": {
+                        "max_health": 15,
+                        "block_power_recovery_pct": 5,
+                        "control_resistance_pct": 7.5
+                    },
+                    "30": {
+                        "max_health": 15,
+                        "block_power_recovery_pct": 5,
+                        "control_resistance_pct": 7.5
+                    }
+                }
+            }
         },
         {
             "id": "willpower",
@@ -157,7 +188,38 @@
                 "WIL",
                 "Willpower"
             ],
-            "notes": "Stat score. Per-point values not yet extracted (page not sent)."
+            "cap": {
+                "player": 30
+            },
+            "per_point": {
+                "cooldown_duration_pct": -1.5,
+                "abilities_energy_cost_pct": -1.5
+            },
+            "milestones": {
+                "stacking": "cumulative",
+                "at": {
+                    "15": {
+                        "magic_power_pct": 7.5,
+                        "pain_resistance_pct": 7.5,
+                        "fortitude_pct": 7.5
+                    },
+                    "20": {
+                        "magic_power_pct": 7.5,
+                        "pain_resistance_pct": 7.5,
+                        "fortitude_pct": 7.5
+                    },
+                    "25": {
+                        "magic_power_pct": 7.5,
+                        "pain_resistance_pct": 7.5,
+                        "fortitude_pct": 7.5
+                    },
+                    "30": {
+                        "magic_power_pct": 7.5,
+                        "pain_resistance_pct": 7.5,
+                        "fortitude_pct": 7.5
+                    }
+                }
+            }
         },
         {
             "id": "level",
@@ -224,7 +286,8 @@
             "unit": "pct",
             "aliases": [
                 "Main Hand Efficiency"
-            ]
+            ],
+            "notes": "Hand efficiency affects weapons in this hand. Dual wielding negatively affects this stat."
         },
         {
             "id": "off_hand_efficiency_pct",
@@ -234,6 +297,18 @@
             "aliases": [
                 "Off-Hand Efficiency",
                 "Off Hand Efficiency"
+            ],
+            "notes": "Hand efficiency affects weapons in this hand. Dual wielding negatively affects this stat."
+        },
+        {
+            "id": "hands_efficiency_pct",
+            "name": "Hands Efficiency",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "notes": "Generic term used in skill texts, applies to the hands (not an average of Main/Off-Hand). Hand scope not confirmed by the wiki; normalizer warns when a skill does not specify a hand.",
+            "aliases": [
+                "Hands Efficiency",
+                "Hand Efficiency"
             ]
         },
         {
@@ -463,6 +538,24 @@
             "notes": "Same scale as Health Restoration, restores 5% of Energy.",
             "aliases": [
                 "Energy Restoration"
+            ]
+        },
+        {
+            "id": "max_energy",
+            "name": "Max Energy",
+            "group": "secondary.survival",
+            "unit": "flat",
+            "aliases": [
+                "Max Energy"
+            ]
+        },
+        {
+            "id": "max_health",
+            "name": "Max Health",
+            "group": "secondary.survival",
+            "unit": "flat",
+            "aliases": [
+                "Max Health"
             ]
         },
         {
