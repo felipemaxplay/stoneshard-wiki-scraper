@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Stoneshard Wiki -> base de dados local em JSON (+ imagens).      [patch 1.2]
+Stoneshard Wiki -> base de dados local em JSON (+ imagens).      [patch 1.3]
 
 Fluxo:
   1. Detecta o api.php da wiki (MediaWiki 1.45.x em stoneshard.com/wiki).
@@ -11,11 +11,13 @@ Fluxo:
        - tabelas   -> lista de objetos em dados_estruturados["tabelas"] (ver parse_tables):
                       * "tabela": cabecalho vira chave (ate cabecalho so de icones)
                       * "grade" : grade de icones/links (ex.: pagina Weapons)
-       - templates -> parametros em dados_estruturados["_wikitext_templates"]
+       - templates -> parametros em _wikitext_templates (no topo do registro, nao em
+                      dados_estruturados); templates de ruido (cores, placeholders) sao descartados
        - imagens de infobox, de celulas de tabela e do corpo sao baixadas; so o
          caminho local e gravado no JSON
-  4. Paginas com infobox (itens) sao "folhas": nao expandimos seus links.
+  4. Paginas com infobox ou ficha de skill (itens) sao "folhas": nao expandimos seus links.
   5. Grava output/pages/<titulo>.json (permite retomar) e output/stoneshard_db.json.
+  6. Pai de breadcrumb: parent_overrides.json (manual, vence sempre) e depois a tabela-pai.
 
 Uso:
   python stoneshard_scraper.py --max-pages 30            # teste curto
@@ -49,7 +51,7 @@ log = logging.getLogger("stoneshard")
 
 # Versao do formato dos registros. Registros salvos com outra versao sao
 # reprocessados (o cache de output/pages e invalidado automaticamente).
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # --------------------------------------------------------------------------- #
 # Configuracao e constantes
@@ -71,6 +73,7 @@ class Config:
     download_images: bool = True
     refresh: bool = False            # ignora cache de paginas ja salvas
     refine_breadcrumbs: bool = True  # pai = pagina cuja tabela lista a pagina (ver refine_breadcrumbs)
+    parent_overrides: Path = Path("parent_overrides.json")   # pai manual (vence a heuristica)
     home_label: str = "Stoneshard Wiki"
     user_agent: str = ("StoneshardOfflineArchiver/1.1 "
                        "(arquivo pessoal offline; contato: voce@exemplo.com)")
@@ -106,8 +109,20 @@ SIDEBAR_SKIP = {"navigation", "search", "toolbox", "languages"}
 # Templates de wikitext que nao carregam dados de conteudo
 SKIP_TEMPLATES = {"stub", "navbox", "languages", "lang", "items", "see also", "main",
                   "clear", "reflist", "notice", "ambox", "toc", "dablink", "about"}
+# Templates de ruido: cores (C, C#2...), largura (W), placeholders ({{{1|...}}}), navegacao
+NOISE_TEMPLATE = re.compile(r"^(?:C|c|W|cl)(?:#\d+)?$|^Template:|^\{\{\{")
 # Colunas cujo conteudo deve ser lido como lista de modificadores (chave: valor)
 STAT_HEADERS = ("propert", "effect", "stat", "bonus", "modif", "attribute", "bonuses")
+# Classificacoes que identificam uma skill (ativa ou passiva)
+SKILL_CLASSES = {"passive", "attack", "maneuver", "spell", "stance"}
+# Pai manual de breadcrumb. Entradas de parent_overrides.json somam-se a estas e vencem.
+DEFAULT_PARENT_OVERRIDES = {
+    "Strength": "Attributes & Stats",
+    "Agility": "Attributes & Stats",
+    "Perception": "Attributes & Stats",
+    "Level": "Attributes & Stats",
+    "Experience": "Attributes & Stats",
+}
 
 META_RE = re.compile(r"(Page last edited during patch|Data Page last updated in):\s*([\w.\-]+)")
 TIER_RE = re.compile(r"^Tier\s+(\d+)\b\s*(.*)$", re.I)
@@ -118,6 +133,7 @@ DAMAGE_LINE_RE = re.compile(r"^(?:\d+(?:\.\d+)?\s+[A-Za-z]+\s+Damage\s*)+$", re.
 PAIR_RE = re.compile(r"([A-Za-z][A-Za-z '’/&-]*?):\s*([+\-−]?\d[\d.,/]*%?)")
 THUMB_RE = re.compile(r"/images/thumb/([0-9a-f]/[0-9a-f]{2})/([^/]+)/[^/]+$")
 THUMB_W_RE = re.compile(r"/(\d+)px-[^/]+$")
+NUMERIC_RE = re.compile(r"[+\-−]?\d[\d.,]*%?")
 # Rotulo de bloco recolhivel: 'Show formulasHide formulas' (dois botoes colados).
 # So casa o PAR Show/Hide, para nao apagar frases normais como 'Hide in Shadows'.
 TOGGLE_PAIR_RE = re.compile(
@@ -721,6 +737,43 @@ def attrs_from_lines(lines: list[str], title: str, attrs: dict | None = None) ->
     return attrs
 
 
+def pair_extras(extras: list[str]) -> tuple[dict[str, Any], list[str]]:
+    """
+    Converte 'Extras' em pares rotulo/valor quando o valor e numerico:
+      ['Backfire Chance', '10', 'Armor Penetration', '0%'] -> {'Backfire Chance': 10, ...}
+    Devolve (pares, sobras).
+    """
+    pairs: dict[str, Any] = {}
+    rest: list[str] = []
+    i = 0
+    while i < len(extras):
+        if (i + 1 < len(extras) and not NUMERIC_RE.fullmatch(extras[i])
+                and NUMERIC_RE.fullmatch(extras[i + 1])):
+            pairs[extras[i]] = convert(extras[i + 1])
+            i += 2
+        else:
+            rest.append(extras[i])
+            i += 1
+    return pairs, rest
+
+
+def normalize_attrs(attrs: dict[str, Any]) -> dict[str, Any]:
+    """Padroniza formas do nivel de pagina: Description sempre lista, Extras como pares."""
+    if isinstance(attrs.get("Description"), str):
+        attrs["Description"] = [attrs["Description"]]
+    if isinstance(attrs.get("Extras"), list):
+        pairs, rest = pair_extras(attrs.pop("Extras"))
+        for k, v in pairs.items():
+            put(attrs, k, v)
+        if rest:
+            attrs["Extras"] = rest
+    return attrs
+
+
+def is_toggle_placeholder(text: str) -> bool:
+    return bool(TOGGLE_SINGLE_RE.match(text))
+
+
 def is_prose(text: str) -> bool:
     """Frase de texto corrido (e nao rotulo/valor de ficha)."""
     t = ICON_RE.sub("", text).strip()
@@ -735,8 +788,8 @@ def leading_block(lines: list[tuple[str, str, frozenset]], title: str):
     """
     Ficha 'solta' (sem <table>): linhas curtas logo no inicio da pagina, antes da 1a frase de
     texto corrido ou titulo. Ex.: 'Double Lunge' / 'Attack' / '10 ⟦energia⟧ 8 ⟦cooldown⟧' /
-    'Type' / 'Target Object' / 'Range' / '1'. So vale se render >= 2 atributos.
-    Devolve (atributos, linhas_restantes).
+    'Type' / 'Target Object' / 'Range' / '1'. Vale se render >= 2 atributos ou uma
+    classificacao de skill (ex.: 'Passive'). Devolve (atributos, linhas_restantes).
     """
     seg: list[str] = []
     for kind, text, _ in lines:
@@ -746,9 +799,17 @@ def leading_block(lines: list[tuple[str, str, frozenset]], title: str):
     if len(seg) < 2:
         return {}, lines
     attrs = attrs_from_lines(seg, title)
-    if len([k for k in attrs if k not in CORE_SKIP]) < 2:
+    core_n = len([k for k in attrs if k not in CORE_SKIP])
+    if core_n < 2 and not is_skill_class(attrs.get("Classification")):
         return {}, lines
     return attrs, lines[len(seg):]
+
+
+def is_skill_class(value: Any) -> bool:
+    """'Passive' / 'Attack / Maneuver' -> True (classificacoes de skill)."""
+    if not isinstance(value, str):
+        return False
+    return value.split(" / ")[0].strip().lower() in SKILL_CLASSES
 
 
 def is_toggle(text: str, flags: Any) -> bool:
@@ -819,6 +880,9 @@ def shape_value(texts: list[str], icons: list[str], header: str) -> Any:
         return normalize_damage(" ".join(texts))
     if h == "tier" and len(texts) == 1 and (m := TIER_RE.match(texts[0])):
         return int(m.group(1))
+    if "basic" in h and len(texts) == 1 and not PAIR_RE.search(texts[0]):
+        # 'Basic Stats' com so um rotulo ('Passive') vira objeto, nao string
+        return {"Classification": texts[0]}
     stat_col = any(s in h for s in STAT_HEADERS)
     multi_pairs = len(texts) == 1 and len(PAIR_RE.findall(texts[0])) >= 2
     if len(texts) >= 2 or stat_col or multi_pairs:
@@ -1019,13 +1083,13 @@ def render_text(lines: list[tuple[str, str, frozenset]]) -> str:
 
 
 def wikitext_templates(wikitext: str) -> dict[str, dict[str, Any]]:
-    """Parametros dos templates de topo (mwparserfromhell), sem templates de navegacao."""
+    """Parametros dos templates de topo (mwparserfromhell), sem templates de ruido/navegacao."""
     out: dict[str, dict[str, Any]] = {}
     try:
         code = mwparserfromhell.parse(wikitext)
         for tpl in code.filter_templates(recursive=False):
             name = str(tpl.name).strip()
-            if name.lower() in SKIP_TEMPLATES or name.startswith("#"):
+            if NOISE_TEMPLATE.match(name) or name.lower() in SKIP_TEMPLATES or name.startswith("#"):
                 continue
             params = {}
             for p in tpl.params:
@@ -1082,13 +1146,27 @@ class ImageStore:
 MAX_LISTING_ROWS = 200      # tabelas maiores que isso sao indices gerais, nao pais de verdade
 
 
-def refine_breadcrumbs(records: list[dict]) -> list[dict]:
+def load_parent_overrides(path: Path) -> dict[str, str]:
+    """Junta DEFAULT_PARENT_OVERRIDES com o arquivo do usuario (o arquivo vence)."""
+    merged = dict(DEFAULT_PARENT_OVERRIDES)
+    if path.exists():
+        try:
+            merged.update(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError) as exc:
+            log.warning("nao consegui ler %s: %s", path, exc)
+    return merged
+
+
+def refine_breadcrumbs(records: list[dict], overrides: dict[str, str] | None = None) -> list[dict]:
     """
     O BFS monta o breadcrumb pelo 1o caminho que descobriu a pagina (ex.: 'Double Lunge' foi
-    achada via 'Combat Formulas'). Aqui o pai passa a ser a pagina cuja TABELA lista a pagina:
-    prefere tabela (linhas) a grade, depois a maior listagem, depois o caminho mais curto.
+    achada via 'Combat Formulas'). Regras, em ordem:
+      1. parent_overrides: pai manual vence sempre.
+      2. Caso contrario, o pai e a pagina cuja TABELA lista a pagina: prefere tabela (linhas)
+         a grade, depois a maior listagem, depois o caminho mais curto.
     Guarda o antigo em 'breadcrumbs_origem'. Evita ciclos. Devolve os registros alterados.
     """
+    overrides = overrides or {}
     by = {r["titulo"]: r for r in records}
     cand: dict[str, list[tuple]] = {}
     for r in records:
@@ -1111,10 +1189,17 @@ def refine_breadcrumbs(records: list[dict]) -> list[dict]:
     def crumbs(title: str, seen: frozenset) -> list[str]:
         if title in memo:
             return memo[title]
-        options = sorted(c for c in cand.get(title, []) if c[3] not in seen and c[3] != title)
-        result = by[title]["breadcrumbs"]
-        if options:
-            result = crumbs(options[0][3], seen | {title}) + [title]
+        if title in overrides:
+            parent = overrides[title]
+            if parent in by and parent not in seen and parent != title:
+                result = crumbs(parent, seen | {title}) + [title]
+            else:
+                result = [parent, title] if parent != title else by[title]["breadcrumbs"]
+        else:
+            options = sorted(c for c in cand.get(title, []) if c[3] not in seen and c[3] != title)
+            result = by[title]["breadcrumbs"]
+            if options:
+                result = crumbs(options[0][3], seen | {title}) + [title]
         memo[title] = result
         return result
 
@@ -1242,7 +1327,8 @@ class Crawler:
             for k, v in sheet.items():
                 attrs.setdefault(k, v)
         core = [k for k in attrs if k not in CORE_SKIP]
-        is_item = len(core) >= 2
+        is_item = (len(core) >= 2 or "Requirement" in attrs
+                   or is_skill_class(attrs.get("Classification")))
 
         # descricao: versao numerica x versao com formulas ('Show formulas')
         head_n = next((i for i, (kd, _, _) in enumerate(lines) if is_heading(kd)), len(lines))
@@ -1257,14 +1343,13 @@ class Crawler:
             body += [("h2", "Formulas", frozenset())] + [("p", t, frozenset()) for t in formulas]
         text = render_text(body + rest)
 
-        # 5) metadados, tabelas e templates do wikitext
+        # 5) metadados, tabelas e templates do wikitext (templates ficam no topo do registro)
         for k, v in meta.items():
             put(attrs, k, v)
+        attrs = normalize_attrs(attrs)
         if tables:
             attrs["tabelas"] = tables
         tpls = wikitext_templates(parsed.get("wikitext", ""))
-        if tpls:
-            attrs["_wikitext_templates"] = tpls
         if not text and parsed.get("wikitext"):
             try:
                 text = mwparserfromhell.parse(parsed["wikitext"]).strip_code().strip()
@@ -1279,6 +1364,7 @@ class Crawler:
             "titulo": title,
             "conteudo_texto": text,
             "dados_estruturados": attrs,
+            "_wikitext_templates": tpls,
             "imagens": images,
             "tipo_pagina": "item" if is_item else "hub",
             "categorias": [c["category"].replace("_", " ") for c in parsed.get("categories", [])
@@ -1306,6 +1392,7 @@ class Crawler:
     def run_pages(self, titles: list[str]) -> None:
         dbg = self.cfg.out_dir / "debug"
         dbg.mkdir(exist_ok=True)
+        overrides = load_parent_overrides(self.cfg.parent_overrides)
         for raw in titles:
             title = norm(raw)
             try:
@@ -1316,8 +1403,11 @@ class Crawler:
             slug = re.sub(r"[^\w\-.'() ]+", "_", parsed["title"]).strip().replace(" ", "_")[:100]
             (dbg / f"{slug}.html").write_text(parsed["text"], encoding="utf-8")
             (dbg / f"{slug}.wikitext").write_text(parsed.get("wikitext", ""), encoding="utf-8")
-            rec = self.build_record(parsed, [norm(parsed["title"])])
-            self._page_file(norm(parsed["title"])).write_text(
+            rec = self.build_record(parsed, [])                  # sem pai: o titulo ja e anexado
+            real = norm(parsed["title"])
+            if real in overrides:                                # pai manual vence
+                rec["breadcrumbs"] = [overrides[real], real]
+            self._page_file(real).write_text(
                 json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
             a = rec["dados_estruturados"]
             log.info("%s: tipo=%s atributos=%s tabelas=%s imagens=%d", rec["titulo"],
@@ -1357,11 +1447,12 @@ class Crawler:
 
     def finish(self) -> None:
         if self.cfg.refine_breadcrumbs:
-            changed = refine_breadcrumbs(self.records)
+            overrides = load_parent_overrides(self.cfg.parent_overrides)
+            changed = refine_breadcrumbs(self.records, overrides)
             for rec in changed:                       # mantem o cache de paginas coerente
                 self._page_file(rec["titulo"]).write_text(
                     json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
-            log.info("breadcrumbs refinados pela tabela-pai: %d paginas", len(changed))
+            log.info("breadcrumbs refinados: %d paginas", len(changed))
         self.records.sort(key=lambda r: r["breadcrumbs"])
         out = self.cfg.out_dir / "stoneshard_db.json"
         out.write_text(json.dumps(self.records, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1387,6 +1478,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--refresh", action="store_true", help="ignora paginas ja salvas")
     ap.add_argument("--no-refine-breadcrumbs", action="store_true",
                     help="mantem o breadcrumb do 1o caminho descoberto (sem pai por tabela)")
+    ap.add_argument("--parent-overrides", type=Path, default=Path("parent_overrides.json"),
+                    help="JSON {pagina: pai} que vence a heuristica de breadcrumb")
     ap.add_argument("--site-root", default="https://stoneshard.com")
     ap.add_argument("--wiki-path", default="/wiki")
     ap.add_argument("--user-agent")
@@ -1396,7 +1489,8 @@ def main(argv: list[str] | None = None) -> int:
                  max_depth=a.max_depth, max_pages=a.max_pages, only_sections=a.section,
                  only_pages=a.page, expand_leaves=a.expand_leaves,
                  download_images=not a.no_images, refresh=a.refresh,
-                 refine_breadcrumbs=not a.no_refine_breadcrumbs)
+                 refine_breadcrumbs=not a.no_refine_breadcrumbs,
+                 parent_overrides=a.parent_overrides)
     if a.user_agent:
         cfg.user_agent = a.user_agent
     a.out.mkdir(parents=True, exist_ok=True)

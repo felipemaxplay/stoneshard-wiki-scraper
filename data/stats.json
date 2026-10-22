@@ -1,0 +1,1038 @@
+{
+    "_schema": "stats/1",
+    "_source": "Attributes & Stats, Strength, Agility, Perception, Level, Stat Points, Ability Points, Experience",
+    "_notes": {
+        "milestones": "Cumulative. Each threshold reached adds its bonuses. The wiki lists the same bonuses under each threshold, so the calculator sums every threshold reached.",
+        "units": "pct = percent points (+5% = 5). flat = plain number. turns = duration."
+    },
+    "stats": [
+        {
+            "id": "strength",
+            "name": "Strength",
+            "group": "primary.stat",
+            "unit": "flat",
+            "cap": {
+                "player": 30
+            },
+            "per_point": {
+                "block_chance_pct": 1.5,
+                "weapon_damage_pct": 1.5
+            },
+            "milestones": {
+                "stacking": "cumulative",
+                "at": {
+                    "15": {
+                        "bodypart_damage_pct": 7.5,
+                        "crit_efficiency_pct": 10,
+                        "armor_damage_pct": 15
+                    },
+                    "20": {
+                        "bodypart_damage_pct": 7.5,
+                        "crit_efficiency_pct": 10,
+                        "armor_damage_pct": 15
+                    },
+                    "25": {
+                        "bodypart_damage_pct": 7.5,
+                        "crit_efficiency_pct": 10,
+                        "armor_damage_pct": 15
+                    },
+                    "30": {
+                        "bodypart_damage_pct": 7.5,
+                        "crit_efficiency_pct": 10,
+                        "armor_damage_pct": 15
+                    }
+                }
+            },
+            "aliases": [
+                "STR",
+                "Strength"
+            ]
+        },
+        {
+            "id": "agility",
+            "name": "Agility",
+            "group": "primary.stat",
+            "unit": "flat",
+            "cap": {
+                "player": 30
+            },
+            "per_point": {
+                "counter_chance_pct": 1.5,
+                "fumble_chance_pct": -1.5,
+                "backfire_chance_pct": -1.5
+            },
+            "milestones": {
+                "stacking": "cumulative",
+                "at": {
+                    "15": {
+                        "dodge_chance_pct": 5,
+                        "hands_efficiency_pct": 2.5,
+                        "move_resistance_pct": 7.5
+                    },
+                    "20": {
+                        "dodge_chance_pct": 5,
+                        "hands_efficiency_pct": 2.5,
+                        "move_resistance_pct": 7.5
+                    },
+                    "25": {
+                        "dodge_chance_pct": 5,
+                        "hands_efficiency_pct": 2.5,
+                        "move_resistance_pct": 7.5
+                    },
+                    "30": {
+                        "dodge_chance_pct": 5,
+                        "hands_efficiency_pct": 2.5,
+                        "move_resistance_pct": 7.5
+                    }
+                }
+            },
+            "aliases": [
+                "AGL",
+                "Agility"
+            ]
+        },
+        {
+            "id": "perception",
+            "name": "Perception",
+            "group": "primary.stat",
+            "unit": "flat",
+            "cap": {
+                "player": 30
+            },
+            "per_point": {
+                "accuracy_pct": 1.5,
+                "armor_penetration_pct": 1.5
+            },
+            "milestones": {
+                "stacking": "cumulative",
+                "at": {
+                    "15": {
+                        "vision": 1,
+                        "bonus_range": 1,
+                        "crit_chance_pct": 5,
+                        "miracle_chance_pct": 5
+                    },
+                    "20": {
+                        "vision": 1,
+                        "bonus_range": 1,
+                        "crit_chance_pct": 5,
+                        "miracle_chance_pct": 5
+                    },
+                    "25": {
+                        "vision": 1,
+                        "bonus_range": 1,
+                        "crit_chance_pct": 5,
+                        "miracle_chance_pct": 5
+                    },
+                    "30": {
+                        "vision": 1,
+                        "bonus_range": 1,
+                        "crit_chance_pct": 5,
+                        "miracle_chance_pct": 5
+                    }
+                }
+            },
+            "aliases": [
+                "PRC",
+                "Perception"
+            ]
+        },
+        {
+            "id": "vitality",
+            "name": "Vitality",
+            "group": "primary.stat",
+            "unit": "flat",
+            "aliases": [
+                "VIT",
+                "Vitality"
+            ],
+            "notes": "Stat score. Per-point values not yet extracted (page not sent)."
+        },
+        {
+            "id": "willpower",
+            "name": "Willpower",
+            "group": "primary.stat",
+            "unit": "flat",
+            "aliases": [
+                "WIL",
+                "Willpower"
+            ],
+            "notes": "Stat score. Per-point values not yet extracted (page not sent)."
+        },
+        {
+            "id": "level",
+            "name": "Level",
+            "group": "primary.character",
+            "unit": "flat",
+            "cap": {
+                "player": 30
+            },
+            "per_level": {
+                "stat_points": 1,
+                "ability_points": 1
+            }
+        },
+        {
+            "id": "experience",
+            "name": "Experience",
+            "group": "primary.character",
+            "unit": "flat"
+        },
+        {
+            "id": "stat_points",
+            "name": "Stat Points",
+            "group": "primary.character",
+            "unit": "flat",
+            "notes": "Spent on Strength, Agility, Perception, Vitality, Willpower."
+        },
+        {
+            "id": "ability_points",
+            "name": "Ability Points",
+            "group": "primary.character",
+            "unit": "flat",
+            "notes": "Spent on learning Abilities (skills)."
+        },
+        {
+            "id": "weapon_damage_pct",
+            "name": "Weapon Damage",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "cap": {
+                "player": 200,
+                "npc_base": 100
+            },
+            "aliases": [
+                "Weapon Damage"
+            ]
+        },
+        {
+            "id": "main_hand_damage",
+            "name": "Main Hand Damage",
+            "group": "secondary.combat",
+            "unit": "flat"
+        },
+        {
+            "id": "off_hand_damage",
+            "name": "Off-Hand Damage",
+            "group": "secondary.combat",
+            "unit": "flat"
+        },
+        {
+            "id": "main_hand_efficiency_pct",
+            "name": "Main Hand Efficiency",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "aliases": [
+                "Main Hand Efficiency"
+            ]
+        },
+        {
+            "id": "off_hand_efficiency_pct",
+            "name": "Off-Hand Efficiency",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "aliases": [
+                "Off-Hand Efficiency",
+                "Off Hand Efficiency"
+            ]
+        },
+        {
+            "id": "bodypart_damage_pct",
+            "name": "Bodypart Damage",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "notes": "Affects Injuries.",
+            "aliases": [
+                "Bodypart Damage"
+            ]
+        },
+        {
+            "id": "armor_damage_pct",
+            "name": "Armor Damage",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "notes": "Affects Durability.",
+            "aliases": [
+                "Armor Damage"
+            ]
+        },
+        {
+            "id": "armor_penetration_pct",
+            "name": "Armor Penetration",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "aliases": [
+                "Armor Penetration"
+            ]
+        },
+        {
+            "id": "accuracy_pct",
+            "name": "Accuracy",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "cap": {
+                "player": 150
+            },
+            "aliases": [
+                "Accuracy"
+            ]
+        },
+        {
+            "id": "crit_chance_pct",
+            "name": "Crit Chance",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "aliases": [
+                "Crit Chance"
+            ]
+        },
+        {
+            "id": "crit_efficiency_pct",
+            "name": "Crit Efficiency",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "cap": {
+                "player": 150
+            },
+            "aliases": [
+                "Crit Efficiency"
+            ]
+        },
+        {
+            "id": "counter_chance_pct",
+            "name": "Counter Chance",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "aliases": [
+                "Counter Chance"
+            ]
+        },
+        {
+            "id": "fumble_chance_pct",
+            "name": "Fumble Chance",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "aliases": [
+                "Fumble Chance"
+            ]
+        },
+        {
+            "id": "abilities_energy_cost_pct",
+            "name": "Abilities Energy Cost",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "cap": {
+                "player": 25
+            },
+            "notes": "Covers both Skills Energy Cost and Spells Energy Cost.",
+            "aliases": [
+                "Abilities Energy Cost",
+                "Skills Energy Cost",
+                "Spells Energy Cost",
+                "Energy Cost"
+            ]
+        },
+        {
+            "id": "cooldown_duration_pct",
+            "name": "Cooldowns Duration",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "cap": {
+                "player": 25
+            },
+            "aliases": [
+                "Cooldowns Duration",
+                "Cooldown Duration"
+            ]
+        },
+        {
+            "id": "bonus_range",
+            "name": "Bonus Range",
+            "group": "secondary.combat",
+            "unit": "flat",
+            "notes": "Rounding rule for skill/spell range is on the Bonus Range page (not extracted yet).",
+            "aliases": [
+                "Bonus Range"
+            ]
+        },
+        {
+            "id": "bleed_chance_pct",
+            "name": "Bleed Chance",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "aliases": [
+                "Bleed Chance"
+            ]
+        },
+        {
+            "id": "daze_chance_pct",
+            "name": "Daze Chance",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "aliases": [
+                "Daze Chance"
+            ]
+        },
+        {
+            "id": "stun_chance_pct",
+            "name": "Stun Chance",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "aliases": [
+                "Stun Chance"
+            ]
+        },
+        {
+            "id": "knockback_chance_pct",
+            "name": "Knockback Chance",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "aliases": [
+                "Knockback Chance"
+            ]
+        },
+        {
+            "id": "immobilization_chance_pct",
+            "name": "Immobilization Chance",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "aliases": [
+                "Immobilization Chance"
+            ]
+        },
+        {
+            "id": "stagger_chance_pct",
+            "name": "Stagger Chance",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "aliases": [
+                "Stagger Chance"
+            ]
+        },
+        {
+            "id": "life_drain_pct",
+            "name": "Life Drain",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "aliases": [
+                "Life Drain"
+            ]
+        },
+        {
+            "id": "energy_drain_pct",
+            "name": "Energy Drain",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "aliases": [
+                "Energy Drain"
+            ]
+        },
+        {
+            "id": "experience_gain_pct",
+            "name": "Experience Gain",
+            "group": "secondary.combat",
+            "unit": "pct",
+            "aliases": [
+                "Experience Gain"
+            ]
+        },
+        {
+            "id": "health_restoration_pct",
+            "name": "Health Restoration",
+            "group": "secondary.survival",
+            "unit": "pct",
+            "notes": "Invisible scale fills by the stat value each turn; at 100% restores 5% of Health.",
+            "aliases": [
+                "Health Restoration"
+            ]
+        },
+        {
+            "id": "healing_efficiency_pct",
+            "name": "Healing Efficiency",
+            "group": "secondary.survival",
+            "unit": "pct",
+            "aliases": [
+                "Healing Efficiency"
+            ]
+        },
+        {
+            "id": "energy_restoration_pct",
+            "name": "Energy Restoration",
+            "group": "secondary.survival",
+            "unit": "pct",
+            "notes": "Same scale as Health Restoration, restores 5% of Energy.",
+            "aliases": [
+                "Energy Restoration"
+            ]
+        },
+        {
+            "id": "protection",
+            "name": "Protection",
+            "group": "secondary.survival",
+            "unit": "flat",
+            "notes": "Divided by body part.",
+            "aliases": [
+                "Protection"
+            ]
+        },
+        {
+            "id": "block_chance_pct",
+            "name": "Block Chance",
+            "group": "secondary.survival",
+            "unit": "pct",
+            "aliases": [
+                "Block Chance"
+            ]
+        },
+        {
+            "id": "block_power",
+            "name": "Block Power",
+            "group": "secondary.survival",
+            "unit": "flat",
+            "aliases": [
+                "Block Power",
+                "Max Block Power"
+            ]
+        },
+        {
+            "id": "block_power_recovery_pct",
+            "name": "Block Power Recovery",
+            "group": "secondary.survival",
+            "unit": "pct",
+            "aliases": [
+                "Block Power Recovery"
+            ]
+        },
+        {
+            "id": "dodge_chance_pct",
+            "name": "Dodge Chance",
+            "group": "secondary.survival",
+            "unit": "pct",
+            "aliases": [
+                "Dodge Chance"
+            ]
+        },
+        {
+            "id": "stealth",
+            "name": "Stealth",
+            "group": "secondary.survival",
+            "unit": "flat"
+        },
+        {
+            "id": "noise_produced",
+            "name": "Noise Produced",
+            "group": "secondary.survival",
+            "unit": "flat"
+        },
+        {
+            "id": "lockpicking_disarming",
+            "name": "Lock-picking & Disarming",
+            "group": "secondary.survival",
+            "unit": "flat"
+        },
+        {
+            "id": "vision",
+            "name": "Vision",
+            "group": "secondary.survival",
+            "unit": "flat",
+            "cap": {
+                "player": 15
+            },
+            "aliases": [
+                "Vision"
+            ]
+        },
+        {
+            "id": "fortitude_pct",
+            "name": "Fortitude",
+            "group": "secondary.survival",
+            "unit": "pct",
+            "cap": {
+                "player": 50
+            },
+            "notes": "50% halves negative effect durations, rounded up. Effects cannot drop below 1 turn.",
+            "aliases": [
+                "Fortitude"
+            ]
+        },
+        {
+            "id": "damage_reflection_pct",
+            "name": "Damage Reflection",
+            "group": "secondary.survival",
+            "unit": "pct",
+            "notes": "Calculated before Protection and Resistances.",
+            "aliases": [
+                "Damage Reflection"
+            ]
+        },
+        {
+            "id": "bleed_resistance_pct",
+            "name": "Bleed Resistance",
+            "group": "secondary.survival",
+            "unit": "pct",
+            "cap": {
+                "player": 80
+            },
+            "notes": "Divided by body part.",
+            "aliases": [
+                "Bleed Resistance"
+            ]
+        },
+        {
+            "id": "control_resistance_pct",
+            "name": "Control Resistance",
+            "group": "secondary.survival",
+            "unit": "pct",
+            "cap": {
+                "player": 80
+            },
+            "aliases": [
+                "Control Resistance"
+            ]
+        },
+        {
+            "id": "move_resistance_pct",
+            "name": "Move Resistance",
+            "group": "secondary.survival",
+            "unit": "pct",
+            "cap": {
+                "player": 80
+            },
+            "aliases": [
+                "Move Resistance"
+            ]
+        },
+        {
+            "id": "hunger_resistance_pct",
+            "name": "Hunger Resistance",
+            "group": "secondary.survival",
+            "unit": "pct"
+        },
+        {
+            "id": "intoxication_resistance_pct",
+            "name": "Intoxication Resistance",
+            "group": "secondary.survival",
+            "unit": "pct"
+        },
+        {
+            "id": "pain_resistance_pct",
+            "name": "Pain Resistance",
+            "group": "secondary.survival",
+            "unit": "pct"
+        },
+        {
+            "id": "fatigue_resistance_pct",
+            "name": "Fatigue Resistance",
+            "group": "secondary.survival",
+            "unit": "pct"
+        },
+        {
+            "id": "damage_taken_pct",
+            "name": "Total Damage Taken",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 25
+            },
+            "aliases": [
+                "Damage Taken",
+                "Total Damage Taken"
+            ]
+        },
+        {
+            "id": "physical_resistance_pct",
+            "name": "Physical Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "notes": "Group. Divided by body part.",
+            "children": [
+                "slashing_resistance_pct",
+                "piercing_resistance_pct",
+                "crushing_resistance_pct",
+                "rending_resistance_pct"
+            ],
+            "aliases": [
+                "Physical Resistance"
+            ]
+        },
+        {
+            "id": "slashing_resistance_pct",
+            "name": "Slashing Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "aliases": [
+                "Slashing Resistance"
+            ]
+        },
+        {
+            "id": "piercing_resistance_pct",
+            "name": "Piercing Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "aliases": [
+                "Piercing Resistance"
+            ]
+        },
+        {
+            "id": "crushing_resistance_pct",
+            "name": "Crushing Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "aliases": [
+                "Crushing Resistance"
+            ]
+        },
+        {
+            "id": "rending_resistance_pct",
+            "name": "Rending Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "aliases": [
+                "Rending Resistance"
+            ]
+        },
+        {
+            "id": "nature_resistance_pct",
+            "name": "Nature Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "children": [
+                "fire_resistance_pct",
+                "frost_resistance_pct",
+                "shock_resistance_pct",
+                "poison_resistance_pct",
+                "caustic_resistance_pct"
+            ],
+            "aliases": [
+                "Nature Resistance"
+            ]
+        },
+        {
+            "id": "fire_resistance_pct",
+            "name": "Fire Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "aliases": [
+                "Fire Resistance"
+            ]
+        },
+        {
+            "id": "frost_resistance_pct",
+            "name": "Frost Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "aliases": [
+                "Frost Resistance"
+            ]
+        },
+        {
+            "id": "shock_resistance_pct",
+            "name": "Shock Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "aliases": [
+                "Shock Resistance"
+            ]
+        },
+        {
+            "id": "poison_resistance_pct",
+            "name": "Poison Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "aliases": [
+                "Poison Resistance"
+            ]
+        },
+        {
+            "id": "caustic_resistance_pct",
+            "name": "Caustic Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "aliases": [
+                "Caustic Resistance"
+            ]
+        },
+        {
+            "id": "magic_resistance_pct",
+            "name": "Magic Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "children": [
+                "arcane_resistance_pct",
+                "unholy_resistance_pct",
+                "sacred_resistance_pct",
+                "psionic_resistance_pct"
+            ],
+            "aliases": [
+                "Magic Resistance"
+            ]
+        },
+        {
+            "id": "arcane_resistance_pct",
+            "name": "Arcane Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "aliases": [
+                "Arcane Resistance"
+            ]
+        },
+        {
+            "id": "unholy_resistance_pct",
+            "name": "Unholy Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "aliases": [
+                "Unholy Resistance"
+            ]
+        },
+        {
+            "id": "sacred_resistance_pct",
+            "name": "Sacred Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "aliases": [
+                "Sacred Resistance"
+            ]
+        },
+        {
+            "id": "psionic_resistance_pct",
+            "name": "Psionic Resistance",
+            "group": "secondary.damage_resistance",
+            "unit": "pct",
+            "cap": {
+                "player": 75
+            },
+            "aliases": [
+                "Psionic Resistance"
+            ]
+        },
+        {
+            "id": "magic_power_pct",
+            "name": "Magic Power",
+            "group": "secondary.magic",
+            "unit": "pct",
+            "cap": {
+                "player": 350
+            },
+            "aliases": [
+                "Magic Power"
+            ]
+        },
+        {
+            "id": "backfire_chance_pct",
+            "name": "Backfire Chance",
+            "group": "secondary.magic",
+            "unit": "pct",
+            "aliases": [
+                "Backfire Chance"
+            ]
+        },
+        {
+            "id": "backfire_damage_pct",
+            "name": "Backfire Damage",
+            "group": "secondary.magic",
+            "unit": "pct",
+            "cap": {
+                "player": 200
+            },
+            "aliases": [
+                "Backfire Damage"
+            ]
+        },
+        {
+            "id": "miracle_chance_pct",
+            "name": "Miracle Chance",
+            "group": "secondary.magic",
+            "unit": "pct",
+            "aliases": [
+                "Miracle Chance"
+            ]
+        },
+        {
+            "id": "miracle_potency_pct",
+            "name": "Miracle Potency",
+            "group": "secondary.magic",
+            "unit": "pct",
+            "cap": {
+                "player": 150
+            },
+            "aliases": [
+                "Miracle Potency"
+            ]
+        },
+        {
+            "id": "pyromantic_power_pct",
+            "name": "Pyromantic Power",
+            "group": "secondary.magic",
+            "unit": "pct",
+            "aliases": [
+                "Pyromantic Power"
+            ]
+        },
+        {
+            "id": "geomantic_power_pct",
+            "name": "Geomantic Power",
+            "group": "secondary.magic",
+            "unit": "pct",
+            "aliases": [
+                "Geomantic Power"
+            ]
+        },
+        {
+            "id": "venomantic_power_pct",
+            "name": "Venomantic Power",
+            "group": "secondary.magic",
+            "unit": "pct",
+            "aliases": [
+                "Venomantic Power"
+            ]
+        },
+        {
+            "id": "cryomantic_power_pct",
+            "name": "Cryomantic Power",
+            "group": "secondary.magic",
+            "unit": "pct",
+            "aliases": [
+                "Cryomantic Power"
+            ]
+        },
+        {
+            "id": "electromantic_power_pct",
+            "name": "Electromantic Power",
+            "group": "secondary.magic",
+            "unit": "pct",
+            "aliases": [
+                "Electromantic Power"
+            ]
+        },
+        {
+            "id": "arcanistic_power_pct",
+            "name": "Arcanistic Power",
+            "group": "secondary.magic",
+            "unit": "pct",
+            "aliases": [
+                "Arcanistic Power"
+            ]
+        },
+        {
+            "id": "astromantic_power_pct",
+            "name": "Astromantic Power",
+            "group": "secondary.magic",
+            "unit": "pct",
+            "aliases": [
+                "Astromantic Power"
+            ]
+        },
+        {
+            "id": "psionic_power_pct",
+            "name": "Psionic Power",
+            "group": "secondary.magic",
+            "unit": "pct",
+            "aliases": [
+                "Psionic Power"
+            ]
+        },
+        {
+            "id": "chronomantic_power_pct",
+            "name": "Chronomantic Power",
+            "group": "secondary.magic",
+            "unit": "pct",
+            "aliases": [
+                "Chronomantic Power"
+            ]
+        },
+        {
+            "id": "hunger",
+            "name": "Hunger",
+            "group": "secondary.health_system",
+            "unit": "flat"
+        },
+        {
+            "id": "thirst",
+            "name": "Thirst",
+            "group": "secondary.health_system",
+            "unit": "flat"
+        },
+        {
+            "id": "intoxication",
+            "name": "Intoxication",
+            "group": "secondary.health_system",
+            "unit": "flat"
+        },
+        {
+            "id": "pain",
+            "name": "Pain",
+            "group": "secondary.health_system",
+            "unit": "flat"
+        },
+        {
+            "id": "fatigue",
+            "name": "Fatigue",
+            "group": "secondary.health_system",
+            "unit": "flat"
+        },
+        {
+            "id": "immunity",
+            "name": "Immunity",
+            "group": "secondary.health_system",
+            "unit": "flat"
+        },
+        {
+            "id": "morale",
+            "name": "Morale",
+            "group": "secondary.health_system",
+            "unit": "flat"
+        },
+        {
+            "id": "sanity",
+            "name": "Sanity",
+            "group": "secondary.health_system",
+            "unit": "flat"
+        }
+    ]
+}
