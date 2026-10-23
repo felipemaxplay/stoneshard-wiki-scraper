@@ -188,10 +188,18 @@ def is_skill_page(rec: dict[str, Any]) -> bool:
     return isinstance(cls, str) and cls.split("/")[0].strip().lower() in KNOWN_CLASSES
 
 
+def is_tree_page(rec: dict[str, Any]) -> bool:
+    """Arvore de verdade: titulo '(skill tree)' ou categoria 'Skill trees'. Inimigos e NPCs listam skills, mas nao sao arvores."""
+    return (rec["titulo"].lower().endswith("(skill tree)")
+            or "Skill trees" in rec.get("categorias", []))
+
+
 def collect_tree_rows(raws: list[dict[str, Any]], warnings: Warnings) -> dict[str, dict[str, Any]]:
     """Linhas 'Skill List' das paginas de arvore: skill -> arvore, treatise e atributos."""
     rows: dict[str, dict[str, Any]] = {}
     for rec in raws:
+        if not is_tree_page(rec):
+            continue
         for tab in rec.get("dados_estruturados", {}).get("tabelas", []):
             if tab.get("tipo") != "tabela" or "Skill" not in tab.get("colunas", []):
                 continue
@@ -367,6 +375,9 @@ def build_skill(key: str, page: dict[str, Any] | None, row: dict[str, Any] | Non
     lines = page_lines(page) if page else row["description"]
     effects_text, passive, unlock_parts = split_text([str(x) for x in lines])
     unlock = parse_unlock(" ".join(unlock_parts), key, stats, warnings)
+    if row and unlock and unlock["treatise"]["tree"] != row["tree"]:
+        warnings.add(key, "arvore da linha difere da arvore do unlock",
+                     {"linha": row["tree"], "unlock": unlock["treatise"]["tree"]})
 
     formula_lines = [str(x) for x in as_list(attrs.get("Formulas"))]
     formulas = parse_formulas(formula_lines, key, stats, warnings)
@@ -409,8 +420,8 @@ def build_skill(key: str, page: dict[str, Any] | None, row: dict[str, Any] | Non
     requirements: list[dict[str, str]] = []
     for req in as_list(attrs.get("Requirement")):
         text = str(req).strip()
-        if m := re.fullmatch(r"Requires an? (\w+)", text):
-            requirements.append({"type": "weapon", "value": m.group(1).lower()})
+        if m := re.fullmatch(r"Requires an? (.+)", text):
+            requirements.append({"type": "weapon", "value": m.group(1).strip().lower()})
         elif re.fullmatch(r"Requires dual weapons", text):
             requirements.append({"type": "weapon_setup", "value": "dual"})
         else:
@@ -491,6 +502,8 @@ def build_trees(raws: list[dict[str, Any]], skills: list[dict[str, Any]],
 
     trees: list[dict[str, Any]] = []
     for rec in raws:
+        if not is_tree_page(rec):
+            continue
         tables = [t for t in rec.get("dados_estruturados", {}).get("tabelas", [])
                   if t.get("tipo") == "tabela" and "Skill" in t.get("colunas", [])]
         if not tables:
