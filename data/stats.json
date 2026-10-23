@@ -574,7 +574,8 @@
             "group": "secondary.survival",
             "unit": "pct",
             "aliases": [
-                "Block Chance"
+                "Block Chance",
+                "BLK_Chance"
             ]
         },
         {
@@ -584,7 +585,8 @@
             "unit": "flat",
             "aliases": [
                 "Block Power",
-                "Max Block Power"
+                "Max Block Power",
+                "MAX_BLK_POW"
             ]
         },
         {

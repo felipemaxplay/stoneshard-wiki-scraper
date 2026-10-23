@@ -353,6 +353,9 @@ def parse_formulas(raw_lines: list[str], skill_id: str, stats: StatIndex,
                 continue
             name = m.group(1).strip()
             stat = stats.resolve(name)
+            # 'X% Chance knocks it back' (Jolt): a pagina Knockback Chance confirma o sentido.
+            if name == "Chance" and re.match(r"\s*knock", raw[m.end():], re.I):
+                stat = "knockback_chance_pct"
             if stat is None:
                 warnings.add(skill_id, "stat de formula desconhecido", {"stat": name, "raw": raw})
                 continue
