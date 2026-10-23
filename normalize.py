@@ -162,18 +162,20 @@ def attrs_of(data: dict[str, Any]) -> dict[str, Any]:
 # Skills: constantes
 # --------------------------------------------------------------------------- #
 
-KNOWN_CLASSES = {"attack", "maneuver", "passive", "stance", "spell"}
-TARGET_TYPES = {"target object": "object", "target tile": "tile", "no target": "none"}
+KNOWN_CLASSES = {"attack", "maneuver", "passive", "stance", "spell", "charge", "active"}
+TARGET_TYPES = {"target object": "object", "target tile": "tile", "no target": "none",
+                "target area": "area", "target point": "point"}
 ROMAN = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5}
 TREATISE_RE = re.compile(r"Treatise\s+([IVX]+)\b")
 SPLIT_RE = re.compile(r"(?=\bTo unlock this ability\b)|(?=\bUnlocked by reading\b)"
                       r"|(?=\bPassive bonus:)")
 PASSIVE_RE = re.compile(r"^Passive bonus:?\s*(.*)$")
 UNLOCK_LEVEL = re.compile(r"reach level (\d+)")
-UNLOCK_POINTS = re.compile(r"at least (\d+) points in the following attributes: ([^.]+)\.")
-UNLOCK_TREATISE = re.compile(r"Unlocked by reading (.+?) Treatise ([IVX]+)")
+UNLOCK_POINTS = re.compile(r"(?:at least (\d+) points in the following attributes: |"
+                           r"spending (\d+) Attribute points into )([^.]+)\.")
+UNLOCK_TREATISE = re.compile(r"(?:Unlocked by reading (.+?) )?Treatise ([IVX]+)")
 # Nome do stat logo apos o '%': so palavras com inicial maiuscula ('Counter Chance until...' -> 'Counter Chance')
-PCT_STAT_RE = re.compile(r"%\s*((?:[A-Z][A-Za-z'\-]*)(?:\s+(?:&|[A-Z][A-Za-z'\-]*)){0,3})")
+PCT_STAT_RE = re.compile(r"%\s*((?:[A-Z][A-Za-z'\-]*)(?:\s+(?:&|[A-Z][A-Za-z'\-]*)){0,3}(?:\s+chance)?)")
 VAR_RE = re.compile(r"[A-Z][A-Za-z]*(?:[ \-][A-Z][A-Za-z]*)*")
 
 
@@ -269,20 +271,23 @@ def parse_unlock(text: str, skill_id: str, stats: StatIndex, warnings: Warnings)
     level = UNLOCK_LEVEL.search(text)
     points = UNLOCK_POINTS.search(text)
     treat = UNLOCK_TREATISE.search(text)
-    if not (level and points and treat):
+    if not (level or points or treat):
         warnings.add(skill_id, "unlock fora do padrao", text)
         return None
     attrs: list[str] = []
-    for raw in re.split(r",\s*|\s+or\s+|\s+and\s+", points.group(2)):
-        sid = stats.resolve(raw.strip())
-        if sid:
-            attrs.append(sid)
-        else:
-            warnings.add(skill_id, "atributo de unlock desconhecido", raw.strip())
+    if points:
+        for raw in re.split(r",\s*|\s+or\s+|\s+and\s+", points.group(3)):
+            sid = stats.resolve(raw.strip())
+            if sid:
+                attrs.append(sid)
+            else:
+                warnings.add(skill_id, "atributo de unlock desconhecido", raw.strip())
     return {
-        "treatise": {"tree": slug(treat.group(1)), "number": ROMAN.get(treat.group(2))},
-        "level": int(level.group(1)),
-        "attribute_points": {"min": int(points.group(1)), "attributes": attrs},
+        "treatise": ({"tree": slug(treat.group(1)) if treat.group(1) else None,
+                      "number": ROMAN.get(treat.group(2))} if treat else None),
+        "level": int(level.group(1)) if level else None,
+        "attribute_points": ({"min": int(points.group(1) or points.group(2)),
+                              "attributes": attrs} if points else None),
     }
 
 
@@ -375,17 +380,18 @@ def build_skill(key: str, page: dict[str, Any] | None, row: dict[str, Any] | Non
     lines = page_lines(page) if page else row["description"]
     effects_text, passive, unlock_parts = split_text([str(x) for x in lines])
     unlock = parse_unlock(" ".join(unlock_parts), key, stats, warnings)
-    if row and unlock and unlock["treatise"]["tree"] != row["tree"]:
+    unlock_tree = (unlock or {}).get("treatise") and unlock["treatise"]["tree"]
+    if row and unlock_tree and unlock_tree != row["tree"]:
         warnings.add(key, "arvore da linha difere da arvore do unlock",
-                     {"linha": row["tree"], "unlock": unlock["treatise"]["tree"]})
+                     {"linha": row["tree"], "unlock": unlock_tree})
 
     formula_lines = [str(x) for x in as_list(attrs.get("Formulas"))]
     formulas = parse_formulas(formula_lines, key, stats, warnings)
     effects, loose = assign_formulas(effects_text, formulas, stats)
 
     tree = row["tree"] if row else None
-    if tree is None and unlock:
-        tree = unlock["treatise"]["tree"]
+    if tree is None and unlock_tree:
+        tree = unlock_tree
     if tree is None and page:
         crumb = next((c for c in page.get("breadcrumbs", [])
                       if c.lower().endswith("(skill tree)")), None)
@@ -394,7 +400,7 @@ def build_skill(key: str, page: dict[str, Any] | None, row: dict[str, Any] | Non
         warnings.add(key, "arvore nao encontrada")
 
     treatise = row["treatise"] if row and row["treatise"] else None
-    if treatise is None and unlock:
+    if treatise is None and unlock and unlock["treatise"]:
         treatise = unlock["treatise"]["number"]
     if treatise is None:
         warnings.add(key, "treatise nao encontrado")
@@ -420,10 +426,10 @@ def build_skill(key: str, page: dict[str, Any] | None, row: dict[str, Any] | Non
     requirements: list[dict[str, str]] = []
     for req in as_list(attrs.get("Requirement")):
         text = str(req).strip()
-        if m := re.fullmatch(r"Requires an? (.+)", text):
-            requirements.append({"type": "weapon", "value": m.group(1).strip().lower()})
-        elif re.fullmatch(r"Requires dual weapons", text):
+        if re.fullmatch(r"Requires dual weapons", text):
             requirements.append({"type": "weapon_setup", "value": "dual"})
+        elif m := re.fullmatch(r"Requires (?:an? )?(.+)", text):
+            requirements.append({"type": "weapon", "value": m.group(1).strip().lower()})
         else:
             requirements.append({"type": "text", "value": text})
             warnings.add(key, "requisito fora do padrao", text)
@@ -458,7 +464,8 @@ def build_skill(key: str, page: dict[str, Any] | None, row: dict[str, Any] | Non
     }
 
 
-def build_all(raws: list[dict[str, Any]], stats: StatIndex, warnings: Warnings) -> list[dict[str, Any]]:
+def build_all(raws: list[dict[str, Any]], stats: StatIndex,
+              warnings: Warnings) -> tuple[list[dict[str, Any]], list[str]]:
     rows = collect_tree_rows(raws, warnings)
     pages: dict[str, dict[str, Any]] = {}
     for rec in raws:
@@ -469,10 +476,19 @@ def build_all(raws: list[dict[str, Any]], stats: StatIndex, warnings: Warnings) 
             warnings.add(key, "pagina de skill duplicada", rec["_source_file"])
             continue
         pages[key] = rec
-    skills = [build_skill(key, pages.get(key), rows.get(key), stats, warnings)
-              for key in sorted(set(pages) | set(rows))]
+    skills: list[dict[str, Any]] = []
+    outside: list[str] = []
+    for key in sorted(set(pages) | set(rows)):
+        local = Warnings()
+        skill = build_skill(key, pages.get(key), rows.get(key), stats, local)
+        # Habilidade de inimigo (pagina sem arvore nem treatise): fica fora de skills.json.
+        if key not in rows and not skill["tree"] and skill["treatise"] is None:
+            outside.append(key)
+            continue
+        warnings.items.extend(local.items)
+        skills.append(skill)
     skills.sort(key=lambda s: (s["tree"] or "", s["treatise"] or 0, s["name"]))
-    return skills
+    return skills, outside
 
 
 # --------------------------------------------------------------------------- #
@@ -570,7 +586,7 @@ def main(argv: list[str] | None = None) -> int:
 
     stats = load_stats(a.data / "stats.json", warnings)
     raws = load_raw_pages(a.pages, warnings)
-    skills = build_all(raws, stats, warnings)
+    skills, outside = build_all(raws, stats, warnings)
 
     trees = build_trees(raws, skills, stats, warnings)
 
@@ -580,9 +596,11 @@ def main(argv: list[str] | None = None) -> int:
     (a.data / "trees.json").write_text(json.dumps(trees, ensure_ascii=False, indent=2) + "\n",
                                        encoding="utf-8")
     warnings.write(a.data / "reports" / "normalize_warnings.json")
+    (a.data / "reports" / "non_tree_skills.json").write_text(
+        json.dumps(sorted(outside), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    log.info("raws: %d; skills: %d; avisos: %d -> %s", len(raws), len(skills),
-             len(warnings.items), out)
+    log.info("raws: %d; skills: %d; fora de arvore: %d; avisos: %d -> %s", len(raws),
+             len(skills), len(outside), len(warnings.items), out)
     return 0
 
 
