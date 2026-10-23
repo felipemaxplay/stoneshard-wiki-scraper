@@ -140,6 +140,16 @@ def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
 
+def collapse_repeats(text: str) -> str:
+    """Nome repetido pelo parser da wiki: 'JoltJolt' -> 'Jolt', 'Set aflameSet aflame' -> 'Set aflame'."""
+    t = text.strip()
+    n = len(t)
+    for k in range(1, n // 2 + 1):
+        if n % k == 0 and t[:k] * (n // k) == t:
+            return t[:k].strip()
+    return t
+
+
 TREE_SUFFIX = re.compile(r"\s*\(skill tree\)$", re.I)
 
 
@@ -209,7 +219,8 @@ def collect_tree_rows(raws: list[dict[str, Any]], warnings: Warnings) -> dict[st
                 name = first(row.get("Skill"))
                 if not name:
                     continue
-                key = slug(str(name))
+                name = collapse_repeats(str(name))
+                key = slug(name)
                 if key in rows:
                     warnings.add(key, "skill aparece em mais de uma arvore", rec["titulo"])
                     continue
