@@ -589,6 +589,41 @@ def build_trees(raws: list[dict[str, Any]], skills: list[dict[str, Any]],
     return trees
 
 
+# --------------------------------------------------------------------------- #
+# Relatorio final (data/reports/summary.json)
+# --------------------------------------------------------------------------- #
+
+UNRESOLVED_REASONS = {"stat de formula desconhecido", "variavel de formula desconhecida",
+                      "atributo de unlock desconhecido", "stat em Modified by desconhecido",
+                      "stat de penalidade de arvore desconhecido"}
+
+
+def build_summary(skills: list[dict[str, Any]], trees: list[dict[str, Any]],
+                  outside: list[str], warnings: Warnings) -> dict[str, Any]:
+    by_reason: dict[str, int] = {}
+    unresolved: dict[str, dict[str, Any]] = {}
+    for w in warnings.items:
+        by_reason[w["reason"]] = by_reason.get(w["reason"], 0) + 1
+        if w["reason"] in UNRESOLVED_REASONS:
+            detail = w.get("detail")
+            name = detail.get("var") or detail.get("stat") if isinstance(detail, dict) else detail
+            entry = unresolved.setdefault(str(name), {"ocorrencias": 0, "skills": []})
+            entry["ocorrencias"] += 1
+            if w["skill"] and w["skill"] not in entry["skills"]:
+                entry["skills"].append(w["skill"])
+    return {
+        "skills": len(skills),
+        "skills_por_arvore": {t["id"]: len(t["skills"]) for t in trees},
+        "skills_sem_arvore": [s["id"] for s in skills if not s["tree"]],
+        "skills_sem_treatise": [s["id"] for s in skills if s["treatise"] is None],
+        "skills_fora_de_arvore": len(outside),
+        "trees": len(trees),
+        "avisos": len(warnings.items),
+        "avisos_por_motivo": dict(sorted(by_reason.items(), key=lambda kv: -kv[1])),
+        "nao_resolvidos": dict(sorted(unresolved.items(), key=lambda kv: -kv[1]["ocorrencias"])),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Normaliza o raw do scraper em data/")
     ap.add_argument("--pages", type=Path, default=Path("output/pages"))
@@ -615,6 +650,10 @@ def main(argv: list[str] | None = None) -> int:
     warnings.write(a.data / "reports" / "normalize_warnings.json")
     (a.data / "reports" / "non_tree_skills.json").write_text(
         json.dumps(sorted(outside), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    summary = build_summary(skills, trees, outside, warnings)
+    (a.data / "reports" / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     log.info("raws: %d; skills: %d; fora de arvore: %d; avisos: %d -> %s", len(raws),
              len(skills), len(outside), len(warnings.items), out)
