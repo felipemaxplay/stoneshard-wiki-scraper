@@ -356,6 +356,9 @@ def parse_formulas(raw_lines: list[str], skill_id: str, stats: StatIndex,
             # 'X% Chance knocks it back' (Jolt): a pagina Knockback Chance confirma o sentido.
             if name == "Chance" and re.match(r"\s*knock", raw[m.end():], re.I):
                 stat = "knockback_chance_pct"
+            # '% Damage' sozinho (Hooking Chop) e Weapon Damage, confirmado pelo autor do projeto.
+            if name == "Damage":
+                stat = "weapon_damage_pct"
             if stat is None:
                 warnings.add(skill_id, "stat de formula desconhecido", {"stat": name, "raw": raw})
                 continue
